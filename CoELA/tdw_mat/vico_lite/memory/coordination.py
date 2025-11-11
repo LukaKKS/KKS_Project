@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Deque, Dict, List, Optional, Tuple
 
 import torch
@@ -13,6 +13,10 @@ class SharedStateSnapshot:
     ema_latent: torch.Tensor
     history: List[torch.Tensor]
     symbolic: List[Dict[str, object]]
+    per_agent_latents: Dict[int, torch.Tensor] = field(default_factory=dict)
+    per_agent_symbolic: Dict[int, List[Dict[str, object]]] = field(default_factory=dict)
+    team_symbolic: List[Dict[str, object]] = field(default_factory=list)
+    agent_id: Optional[int] = None
 
 
 class SharedMemory:
@@ -48,4 +52,8 @@ class SharedMemory:
             ema_latent=ema.detach().clone(),
             history=list(self._history),
             symbolic=self._symbolic,
+            per_agent_latents={},
+            per_agent_symbolic={},
+            team_symbolic=self._symbolic,
+            agent_id=None,
         )

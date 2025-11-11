@@ -48,6 +48,8 @@ class PolicyReasoner:
         self.client = self._setup_client()
         self.last_call_ts: float = 0.0
         self._warning_logged: Dict[str, bool] = {}
+        self._prompt_template = self._load_prompt_template()
+        self._last_signature: Optional[Tuple[str, Optional[Tuple[float, float, float]]]] = None
 
     def _setup_client(self):  # type: ignore[override]
         api_key = os.getenv("OPENAI_API_KEY")
@@ -113,7 +115,7 @@ class PolicyReasoner:
     # Candidate generation -------------------------------------------------------
     def _query_candidates(self, context: Dict[str, Any]) -> List[Dict[str, Any]]:
         prompt = self._build_prompt(context)
-        response = self._chat_completion(prompt)
+        response = self._chat_completion(prompt, context)
         if response is None:
             return []
         last_exc: Optional[Exception] = None
@@ -129,37 +131,68 @@ class PolicyReasoner:
             except Exception as exc:  # pragma: no cover
                 last_exc = exc
         if last_exc is not None:
-            LOGGER.warning("Failed to parse candidate JSON (%s)", last_exc)
+            LOGGER.warning(
+                "PolicyReasoner failed to parse candidate JSON (frame=%s err=%s resp=%r)",
+                context.get("frame"),
+                last_exc,
+                response[:200],
+            )
         return []
 
     def _build_prompt(self, context: Dict[str, Any]) -> List[Dict[str, str]]:
         description = context.get("memory_symbolic", [])
-        skip_targets = list(context.get("skip_targets", []))
-        prompt = (
-            "You are a cooperative household robot assistant. "
-            "Plan the next high-level action in JSON with fields action, target_id, target_pos, reason, confidence."
-        )
-        if skip_targets:
-            prompt += f" Avoid targets: {skip_targets}."
-        prompt += " Use short reasoning."
+        nav_guard = []
+        guard_info = context.get("nav_guard_info", {}) or {}
+        if isinstance(guard_info, dict):
+            for key, value in guard_info.items():
+                if isinstance(key, (list, tuple)):
+                    guard_key = list(key)
+                else:
+                    guard_key = key
+                nav_guard.append({"target": guard_key, "cooldown": value})
+        payload = {
+            "frame": context.get("frame"),
+            "role": context.get("role"),
+            "subgoal": context.get("subgoal"),
+            "holding_ids": context.get("holding_ids"),
+            "current_room": context.get("current_room"),
+            "memory_symbolic": description,
+            "team_symbolic": context.get("team_symbolic", []),
+            "partner_symbolic": context.get("partner_symbolic", {}),
+            "skip_targets": context.get("skip_targets", {"names": [], "coords": []}),
+            "nav_guard_info": nav_guard,
+            "recent_actions": context.get("recent_actions"),
+        }
         return [
-            {"role": "system", "content": prompt},
+            {"role": "system", "content": self._prompt_template},
             {
                 "role": "user",
-                "content": json.dumps(
-                    {
-                        "frame": context.get("frame"),
-                        "role": context.get("role"),
-                        "subgoal": context.get("subgoal"),
-                        "holding_ids": context.get("holding_ids"),
-                        "memory": description,
-                    },
-                    ensure_ascii=False,
-                ),
+                "content": json.dumps(payload, ensure_ascii=False),
             },
         ]
 
-    def _chat_completion(self, messages: List[Dict[str, str]]) -> Optional[str]:
+    def _load_prompt_template(self) -> str:
+        candidate_paths = [
+            os.path.join(os.path.dirname(__file__), "..", "..", "LLM", "prompt_vico_lite_reasoner.txt"),
+            os.path.join(os.getcwd(), "CoELA", "tdw_mat", "LLM", "prompt_vico_lite_reasoner.txt"),
+        ]
+        for path in candidate_paths:
+            norm_path = os.path.abspath(path)
+            if os.path.exists(norm_path):
+                try:
+                    with open(norm_path, "r", encoding="utf-8") as f:
+                        return f.read().strip()
+                except Exception as exc:
+                    LOGGER.warning("PolicyReasoner failed to load prompt template (%s): %s", norm_path, exc)
+        LOGGER.warning("PolicyReasoner using fallback prompt template.")
+        return (
+            "You are a cooperative household robot assistant. Respond with a JSON object containing a"
+            " 'candidates' array. Each candidate must include action, target_id, target_pos, reason,"
+            " confidence, distance, visibility, novelty, role_alignment, penalty. Avoid previously"
+            " skipped targets and keep positions within bounds."
+        )
+
+    def _chat_completion(self, messages: List[Dict[str, str]], context: Optional[Dict[str, Any]] = None) -> Optional[str]:
         if self.client is None:
             return None
         try:
@@ -167,8 +200,16 @@ class PolicyReasoner:
                 model=self.cfg.reasoner_model,
                 messages=messages,
                 temperature=self.cfg.reasoner_temperature,
+                response_format={"type": "json_object"},
             )
             content = response.choices[0].message.content
+            if content is None:
+                LOGGER.warning("PolicyReasoner received empty content (frame=%s)", (context or {}).get("frame"))
+                return None
+            frame = (context or {}).get("frame")
+            if not self._warning_logged.get("raw_response"):
+                LOGGER.warning("PolicyReasoner raw response (frame=%s snippet=%s)", frame, content[:200])
+                self._warning_logged["raw_response"] = True
             return content
         except Exception as exc:  # pragma: no cover
             LOGGER.warning("PolicyReasoner chat completion failed (%s)", exc)
@@ -200,7 +241,7 @@ class PolicyReasoner:
                 ),
             },
         ]
-        response = self._chat_completion(messages)
+        response = self._chat_completion(messages, context)
         if response is None:
             return None
         for block in self._iter_json_blocks(response):
@@ -215,23 +256,53 @@ class PolicyReasoner:
     # Heuristics -----------------------------------------------------------------
     def _select_plan(self, context: Dict[str, Any], candidates: List[Dict[str, Any]]) -> Optional[ReasonerPlan]:
         weights = self.cfg.reasoner_heuristic_weights
-        skip_targets = set(context.get("skip_targets", []))
-        best_score = -float("inf")
-        best_candidate: Optional[Dict[str, Any]] = None
+        skip_spec = context.get("skip_targets", {}) or {}
+        skip_names = {str(name).lower() for name in skip_spec.get("names", [])}
+        skip_coords = {
+            (round(float(coord[0]), 2), round(float(coord[1]), 2))
+            for coord in skip_spec.get("coords", [])
+            if isinstance(coord, (list, tuple)) and len(coord) >= 2
+        }
+        action_bonus = {
+            "pick": 6.0,
+            "deliver": 6.0,
+            "assist": 3.0,
+            "move": 1.0,
+            "search": 0.0,
+            "wait": -2.0,
+            "idle": -5.0,
+        }
+        scored: List[Tuple[float, Dict[str, Any]]] = []
+        last_signature = self._last_signature
         for candidate in candidates:
-            action = str(candidate.get("action", "search"))
+            raw_action = str(candidate.get("action", "search") or "search").strip().lower()
+            action = self._normalise_action(raw_action)
+            if not action:
+                continue
             if self.cfg.action_blacklist and action in self.cfg.action_blacklist:
                 continue
             if self.cfg.action_whitelist and action not in self.cfg.action_whitelist:
                 continue
             target_name = candidate.get("target_name")
-            if target_name in skip_targets:
+            if isinstance(target_name, str) and target_name.lower() in skip_names:
                 continue
-            distance = float(candidate.get("distance", 1.0) or 1.0)
-            visibility = float(candidate.get("visibility", 0.5) or 0.5)
-            novelty = float(candidate.get("novelty", 0.5) or 0.5)
-            alignment = float(candidate.get("role_alignment", 0.5) or 0.5)
-            penalty = float(candidate.get("penalty", 0.0) or 0.0)
+            target_pos = candidate.get("target_pos") or candidate.get("target_position")
+            target_tuple: Optional[Tuple[float, float, float]]
+            if isinstance(target_pos, (list, tuple)) and len(target_pos) == 3:
+                target_tuple = (float(target_pos[0]), float(target_pos[1]), float(target_pos[2]))
+            else:
+                target_tuple = None
+            if action in {"move", "search", "deliver", "assist", "pick"} and target_tuple is None:
+                continue
+            if target_tuple is not None:
+                coord_key = (round(float(target_tuple[0]), 2), round(float(target_tuple[2]), 2))
+                if coord_key in skip_coords:
+                    continue
+            distance = self._safe_float(candidate.get("distance"), 1.0)
+            visibility = self._safe_float(candidate.get("visibility"), 0.5)
+            novelty = self._safe_float(candidate.get("novelty"), 0.5)
+            alignment = self._safe_float(candidate.get("role_alignment"), 0.5)
+            penalty = self._safe_float(candidate.get("penalty"), 0.0)
             score = (
                 weights.get("distance", 1.0) * (1.0 / (distance + 1e-3))
                 + weights.get("visibility", 0.5) * visibility
@@ -239,37 +310,66 @@ class PolicyReasoner:
                 + weights.get("role_alignment", 0.5) * alignment
                 - weights.get("penalty", 1.0) * penalty
             )
+            score += action_bonus.get(action, 0.0)
+            if action == "search":
+                score -= 0.4 * max(distance - 3.0, 0.0)
+            if last_signature is not None:
+                last_action, last_target = last_signature
+                if action == last_action:
+                    if action in {"search", "move"} and target_tuple is not None and last_target is not None:
+                        lt = (round(last_target[0], 2), round(last_target[2], 2))
+                        ct = (round(target_tuple[0], 2), round(target_tuple[2], 2))
+                        if lt == ct:
+                            score -= 4.0
+                    elif action in {"pick", "deliver"}:
+                        score += 1.0
+                    elif action == "wait":
+                        score -= 3.0
+            candidate["action"] = action
             candidate["_score"] = score
-            if score > best_score:
-                best_score = score
-                best_candidate = candidate
-        if best_candidate is None:
+            candidate["_target_tuple"] = target_tuple
+            scored.append((score, candidate))
+        if not scored:
             return None
-        target_pos = best_candidate.get("target_pos") or best_candidate.get("target_position")
-        if isinstance(target_pos, list) and len(target_pos) == 3:
-            target_tuple = tuple(float(x) for x in target_pos)  # type: ignore[assignment]
-        elif isinstance(target_pos, tuple) and len(target_pos) == 3:
-            target_tuple = tuple(float(x) for x in target_pos)
-        else:
-            target_tuple = None
+        scored.sort(key=lambda item: item[0], reverse=True)
+        has_non_wait = any(item[1].get("action") not in {"wait", "idle"} for item in scored)
+        chosen: Optional[Dict[str, Any]] = None
+        for _, candidate in scored:
+            action = str(candidate.get("action", "search"))
+            if has_non_wait and action in {"wait", "idle"}:
+                continue
+            target_tuple = candidate.get("_target_tuple")
+            if action in {"move", "search", "deliver", "assist", "pick"} and target_tuple is None:
+                continue
+            chosen = candidate
+            break
+        if chosen is None:
+            return None
+        action = str(chosen.get("action", "search"))
+        target_tuple = chosen.get("_target_tuple")
+        if "_target_tuple" in chosen:
+            chosen = dict(chosen)
+            chosen.pop("_target_tuple", None)
         plan = ReasonerPlan(
-            action_type=str(best_candidate.get("action", "search")),
-            target_id=best_candidate.get("target_id"),
+            action_type=action,
+            target_id=chosen.get("target_id"),
             target_position=target_tuple,  # type: ignore[arg-type]
-            confidence=float(best_candidate.get("confidence", 0.6)),
-            meta=best_candidate,
+            confidence=float(chosen.get("confidence", 0.6)),
+            meta=chosen,
         )
+        self._last_signature = (plan.action_type, plan.target_position)
         return plan
 
     def _heuristic_plan(self, context: Dict[str, Any]) -> ReasonerPlan:
         symbolic = context.get("memory_symbolic", [])
-        skip_targets = set(context.get("skip_targets", []))
+        skip_spec = context.get("skip_targets", {}) or {}
+        skip_names = {str(name).lower() for name in skip_spec.get("names", [])}
         candidates: List[Tuple[float, Dict[str, Any]]] = []
         for entry in symbolic:
             for candidate in entry.get("candidates", []):
                 name = candidate.get("name")
                 score = float(candidate.get("score", 0.0))
-                if name in skip_targets:
+                if isinstance(name, str) and name.lower() in skip_names:
                     continue
                 distance = float(candidate.get("distance", 1.0))
                 heur_score = self._score_candidate(distance=distance, similarity=score)
@@ -301,6 +401,55 @@ class PolicyReasoner:
         if matches:
             return [match.group(1).strip() for match in matches]
         return [text]
+
+    def _safe_float(self, value: Any, default: float) -> float:
+        if value is None:
+            return default
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                return float(value)
+            except ValueError:
+                lowered = value.strip().lower()
+                qualitative = {
+                    "high": 0.9,
+                    "medium": 0.5,
+                    "low": 0.2,
+                    "near": 0.5,
+                    "close": 0.3,
+                    "far": 1.5,
+                    "visible": 0.8,
+                    "clear": 0.7,
+                    "unknown": default,
+                }
+                if lowered in qualitative:
+                    return qualitative[lowered]
+        return default
+
+    def _normalise_action(self, action: str) -> str:
+        if not action:
+            return ""
+        aliases = {
+            "scan": "search",
+            "explore": "search",
+            "inspect": "search",
+            "observe": "search",
+            "survey": "search",
+            "investigate": "search",
+            "look": "search",
+            "look_around": "search",
+            "move_to": "move",
+            "go_to": "move",
+            "goto": "move",
+            "navigate": "move",
+            "walk": "move",
+            "approach": "move",
+            "stay": "wait",
+            "hold": "wait",
+        }
+        normalized = aliases.get(action, action)
+        return normalized
 
 
 __all__ = ["PolicyReasoner", "ReasonerPlan", "ReasonerOutput"]

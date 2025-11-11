@@ -49,7 +49,8 @@ class PerceptionAlignmentPipeline:
         fused_components.append(clip_text)
         fused = torch.cat(fused_components, dim=-1)
         similarity = clip_image @ clip_text.unsqueeze(-1)
-        symbolic = build_symbolic_descriptions(similarity, observation.get("object_names", []), self.cfg.symbolic_top_k)
+        object_infos = observation.get("object_infos") or [{"name": name} for name in observation.get("object_names", [])]
+        symbolic = build_symbolic_descriptions(similarity, object_infos, top_k=self.cfg.symbolic_top_k)
         return PerceptionOutput(vision_latent=clip_image.squeeze(0), text_latent=clip_text, fused_latent=fused, symbolic=symbolic)
 
     def _ensure_tensor(self, value: Any) -> torch.Tensor:

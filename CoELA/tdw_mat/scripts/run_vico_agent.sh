@@ -14,6 +14,8 @@ if [ -f "$ENV_FILE" ]; then
   set +a
 fi
 
+echo "OPENAI_API_KEY length: ${#OPENAI_API_KEY}"
+
 echo "[run_vico_agent] model=$MODEL, episodes=$EPISODES, run_id=$RUN_ID, port=$PORT"
 
 echo "Killing any existing TDW processes on port $PORT..."

@@ -11,7 +11,16 @@ from vico_lite.policy import ViCoPolicy
 
 
 class ViCoAgent:
-    def __init__(self, agent_id, logger, max_frames, args=None, output_dir: str = "results", device: str = "cpu"):
+    def __init__(
+        self,
+        agent_id,
+        logger,
+        max_frames,
+        args=None,
+        output_dir: str = "results",
+        device: str = "cpu",
+        shared_memory_hub=None,
+    ):
         self.agent_type = "vico_agent"
         self.agent_id = agent_id
         self.logger = logger
@@ -35,6 +44,7 @@ class ViCoAgent:
         self.policy: Optional[ViCoPolicy] = None
         self.env_api: Optional[Dict[str, Any]] = None
         self.agent_color = [-1, -1, -1]
+        self.shared_hub = shared_memory_hub
 
     def reset(
         self,
@@ -47,6 +57,7 @@ class ViCoAgent:
         rooms_name=None,
         gt_mask: bool = True,
         save_img: bool = True,
+        episode_index: Optional[int] = None,
     ):
         self.output_dir = output_dir or self.output_dir
         self.goal_objects = goal_objects or {}
@@ -69,12 +80,16 @@ class ViCoAgent:
             map_size=self.map_size,
             scene_bounds=self.scene_bounds,
         )
+        if self.shared_hub is not None:
+            self.shared_hub.begin_episode(episode_index)
+            self.shared_hub.register_agent(self.agent_id)
         self.policy = ViCoPolicy(
             self.cfg,
             agent_id=self.agent_id,
             logger=self.logger,
             agent_memory=self.agent_memory,
             env_api=self.env_api,
+            memory_hub=self.shared_hub,
             device=self.device,
         )
         self.policy.reset()

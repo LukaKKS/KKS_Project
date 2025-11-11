@@ -27,7 +27,14 @@ def _default_action_blacklist() -> List[str]:
 
 
 def _default_action_whitelist() -> Optional[List[str]]:
-    return None
+    return [
+        "search",
+        "move",
+        "pick",
+        "deliver",
+        "assist",
+        "idle",
+    ]
 
 
 @dataclass

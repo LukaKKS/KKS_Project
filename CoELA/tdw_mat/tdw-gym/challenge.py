@@ -6,6 +6,7 @@ import time
 import pickle
 import logging
 import sys
+from typing import Optional
 
 # add this dictionary to python env path:
 base_path = os.getcwd()
@@ -14,6 +15,8 @@ sys.path.append(base_path)
 from h_agent import H_agent
 from lm_agent import lm_agent
 from vico_agent import ViCoAgent
+from vico_lite.config import ViCoConfig
+from vico_lite.memory_bridge import TeamMemoryHub
 
 gym.envs.registration.register(
     id='transport_challenge_MA',
@@ -76,6 +79,7 @@ class Challenge:
                             rooms_name=info['rooms_name'],
                             gt_mask=self.gt_mask,
                             save_img=self.save_img,
+                            episode_index=episode,
                         )
                     else:
                         raise Exception(f"{agent.agent_type} not available")
@@ -198,13 +202,25 @@ def main():
 
     challenge = Challenge(logger, args.port, args.data_path, args.output_dir, args.number_of_agents, args.max_frames, not args.no_launch_build, screen_size = args.screen_size, data_prefix=args.data_prefix, gt_mask = not args.no_gt_mask, save_img = not args.no_save_img)
     agents = []
+    shared_vico_hub: Optional[TeamMemoryHub] = None
     for i, agent in enumerate(args.agents):
         if agent == 'h_agent':
             agents.append(H_agent(i, logger, args.max_frames, args.output_dir))
         elif agent == 'lm_agent':
             agents.append(lm_agent(i, logger, args.max_frames, args, args.output_dir))
         elif agent == 'vico_agent':
-            agents.append(ViCoAgent(i, logger, args.max_frames, args, args.output_dir))
+            if shared_vico_hub is None:
+                shared_vico_hub = TeamMemoryHub(ViCoConfig())
+            agents.append(
+                ViCoAgent(
+                    i,
+                    logger,
+                    args.max_frames,
+                    args,
+                    args.output_dir,
+                    shared_memory_hub=shared_vico_hub,
+                )
+            )
         else:
             raise Exception(f"{agent} not available")
     try:

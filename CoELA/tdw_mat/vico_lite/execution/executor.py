@@ -66,6 +66,7 @@ class PlanExecutor:
         if self.agent_memory is None:
             meta["reason"] = "no_agent_memory"
             return {"type": "ongoing"}, meta
+        target_pos = self._clamp_target(target_pos)
         if hasattr(self.agent_memory, "belongs_to_which_room"):
             room = self.agent_memory.belongs_to_which_room(target_pos)
             if room is None and hasattr(self.agent_memory, "center_of_room"):
@@ -124,7 +125,7 @@ class PlanExecutor:
         map_size = getattr(self.agent_memory, "map_size")
         if not map_size:
             return None
-        return float(max(map_size)) * self.cfg.navigation_guard_ratio
+        return float(min(map_size)) * self.cfg.navigation_guard_ratio
 
     def tick(self):
         removal = []
@@ -137,3 +138,23 @@ class PlanExecutor:
 
     def guard_summary(self):
         return {key: value["frames"] for key, value in self._guard_skip.items()}
+
+    def _clamp_target(self, target_pos):
+        if self.agent_memory is None or not hasattr(self.agent_memory, "_scene_bounds"):
+            return target_pos
+        bounds = getattr(self.agent_memory, "_scene_bounds", None)
+        if not bounds:
+            return target_pos
+        x, y, z = target_pos
+        clamped_x = min(max(x, bounds.get("x_min", x)), bounds.get("x_max", x))
+        clamped_z = min(max(z, bounds.get("z_min", z)), bounds.get("z_max", z))
+        if clamped_x != x or clamped_z != z:
+            if self.logger and getattr(self.logger, "debug", None):
+                self.logger.debug(
+                    "[Executor] clamp target from %s to (%s, %s, %s)",
+                    target_pos,
+                    clamped_x,
+                    y,
+                    clamped_z,
+                )
+        return (clamped_x, y, clamped_z)

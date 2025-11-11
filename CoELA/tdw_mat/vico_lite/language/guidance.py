@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 from ..config import ViCoConfig
@@ -24,6 +24,7 @@ class GuidanceResult:
     role: Optional[str]
     subgoal: Optional[str]
     source: str
+    debug: Dict[str, Any] = field(default_factory=dict)
 
 
 class GuidanceController:
@@ -40,6 +41,9 @@ class GuidanceController:
         agent_state: Dict[str, Any],
         extra: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        skip_targets = agent_state.get("skip_targets", {"names": set(), "coords": set()}) or {"names": set(), "coords": set()}
+        names = sorted({str(name).lower() for name in skip_targets.get("names", set())})
+        coords = [list(coord) for coord in sorted(skip_targets.get("coords", set()))]
         context: Dict[str, Any] = {
             "agent_id": agent_id,
             "frame": frame,
@@ -50,8 +54,18 @@ class GuidanceController:
             "recent_actions": memory.recent_actions(5),
             "memory_step": snapshot.step,
             "memory_symbolic": snapshot.symbolic,
-            "skip_targets": agent_state.get("skip_targets", set()),
+            "skip_targets": {"names": names, "coords": coords},
         }
+        partner_symbolic = {}
+        if snapshot.per_agent_symbolic:
+            for participant, entries in snapshot.per_agent_symbolic.items():
+                if participant == agent_id:
+                    continue
+                partner_symbolic[str(participant)] = entries
+        if snapshot.team_symbolic:
+            context["team_symbolic"] = snapshot.team_symbolic
+        if partner_symbolic:
+            context["partner_symbolic"] = partner_symbolic
         if extra:
             context.update(extra)
         return context
@@ -59,7 +73,13 @@ class GuidanceController:
     def decide(self, context: Dict[str, Any], force_heuristics: bool = False) -> GuidanceResult:
         output: ReasonerOutput = self.reasoner.decide(context, force_heuristics=force_heuristics)
         if output.plan is None:
-            return GuidanceResult(plan=None, role=output.role, subgoal=output.subgoal, source=output.source)
+            return GuidanceResult(
+                plan=None,
+                role=output.role,
+                subgoal=output.subgoal,
+                source=output.source,
+                debug=output.debug,
+            )
         plan = ReasonedPlan(
             action_type=output.plan.action_type,
             target_id=output.plan.target_id,
@@ -67,4 +87,10 @@ class GuidanceController:
             confidence=output.plan.confidence,
             meta=output.plan.meta,
         )
-        return GuidanceResult(plan=plan, role=output.role, subgoal=output.subgoal, source=output.source)
+        return GuidanceResult(
+            plan=plan,
+            role=output.role,
+            subgoal=output.subgoal,
+            source=output.source,
+            debug=output.debug,
+        )
