@@ -10,7 +10,7 @@ Project Website: [CoELA](https://umass-embodied-agi.github.io/CoELA/)
 
 ![Pipeline](assets/framework.png)
 
-## News
+## News 1101 수정했어요~
 
 **[8/25/2024]**: Updates on the navigation module of agents on the `ThreeDWorld Multi-Agent Transport` environment to fix the navigation issues.
 
