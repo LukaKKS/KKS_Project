@@ -6,7 +6,7 @@ import os
 import re
 import time
 from dataclasses import dataclass
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -150,6 +150,15 @@ class PolicyReasoner:
                 else:
                     guard_key = key
                 nav_guard.append({"target": guard_key, "cooldown": value})
+        skip_targets = context.get("skip_targets", {"names": [], "coords": []})
+        skip_text = context.get("skip_targets_text", {})
+        name_strings = skip_text.get("names") or skip_targets.get("names", [])
+        skip_summary = {
+            "names": skip_targets.get("names", []),
+            "coords": skip_targets.get("coords", []),
+            "coords_str": skip_text.get("coords", []),
+            "names_str": ", ".join(name_strings) if name_strings else "",
+        }
         payload = {
             "frame": context.get("frame"),
             "role": context.get("role"),
@@ -159,9 +168,15 @@ class PolicyReasoner:
             "memory_symbolic": description,
             "team_symbolic": context.get("team_symbolic", []),
             "partner_symbolic": context.get("partner_symbolic", {}),
-            "skip_targets": context.get("skip_targets", {"names": [], "coords": []}),
+            "skip_targets": skip_summary,
             "nav_guard_info": nav_guard,
             "recent_actions": context.get("recent_actions"),
+            "task_type": context.get("task_type"),
+            "task_targets": context.get("task_targets", []),
+            "task_containers": context.get("task_containers", []),
+            "grabbable_names": context.get("grabbable_names", []),
+            "visible_objects": context.get("visible_objects", []),
+            "goal_objects": context.get("goal_objects", {}),
         }
         return [
             {"role": "system", "content": self._prompt_template},
@@ -263,6 +278,34 @@ class PolicyReasoner:
             for coord in skip_spec.get("coords", [])
             if isinstance(coord, (list, tuple)) and len(coord) >= 2
         }
+        task_targets = {str(name).lower() for name in context.get("task_targets", [])}
+        task_containers = {str(name).lower() for name in context.get("task_containers", [])}
+        grabbable_names = {str(name).lower() for name in context.get("grabbable_names", [])}
+        guard_spec = context.get("nav_guard_info", {}) or {}
+        guard_coords: Set[Tuple[float, float]] = set()
+        if isinstance(guard_spec, dict):
+            for key in guard_spec.keys():
+                if isinstance(key, (list, tuple)) and len(key) >= 2:
+                    guard_coords.add((round(float(key[0]), 2), round(float(key[1]), 2)))
+                elif isinstance(key, str):
+                    try:
+                        parts = key.strip("()[]").split(",")
+                        if len(parts) >= 2:
+                            guard_coords.add((round(float(parts[0]), 2), round(float(parts[1]), 2)))
+                    except Exception:
+                        continue
+        blocked_coords = skip_coords | guard_coords
+        block_radius = 0.6
+
+        def _is_blocked(x: float, z: float) -> bool:
+            qx = round(x, 2)
+            qz = round(z, 2)
+            if (qx, qz) in blocked_coords:
+                return True
+            for bx, bz in blocked_coords:
+                if abs(bx - qx) <= block_radius and abs(bz - qz) <= block_radius:
+                    return True
+            return False
         action_bonus = {
             "pick": 6.0,
             "deliver": 6.0,
@@ -298,6 +341,12 @@ class PolicyReasoner:
                 coord_key = (round(float(target_tuple[0]), 2), round(float(target_tuple[2]), 2))
                 if coord_key in skip_coords:
                     continue
+                if _is_blocked(float(target_tuple[0]), float(target_tuple[2])):
+                    continue
+            name_lc = str(target_name).lower() if isinstance(target_name, str) else ""
+            is_task_target = name_lc in task_targets
+            is_task_container = name_lc in task_containers
+            is_grabbable = name_lc in grabbable_names or is_task_target
             distance = self._safe_float(candidate.get("distance"), 1.0)
             visibility = self._safe_float(candidate.get("visibility"), 0.5)
             novelty = self._safe_float(candidate.get("novelty"), 0.5)
@@ -311,6 +360,27 @@ class PolicyReasoner:
                 - weights.get("penalty", 1.0) * penalty
             )
             score += action_bonus.get(action, 0.0)
+            if action == "pick":
+                if not isinstance(target_name, str):
+                    score -= 3.0
+                    continue
+                if is_task_target:
+                    score += 5.0
+                elif is_grabbable:
+                    score += 2.5
+                else:
+                    score -= 2.0
+                score -= 0.3 * max(distance - 1.2, 0.0)
+            elif action == "deliver":
+                if is_task_container:
+                    score += 3.0
+                else:
+                    score -= 1.0
+            elif action == "move":
+                if is_task_target or is_task_container:
+                    score += 1.0
+                elif name_lc:
+                    score -= 0.4
             if action == "search":
                 score -= 0.4 * max(distance - 3.0, 0.0)
             if last_signature is not None:
@@ -364,6 +434,7 @@ class PolicyReasoner:
         symbolic = context.get("memory_symbolic", [])
         skip_spec = context.get("skip_targets", {}) or {}
         skip_names = {str(name).lower() for name in skip_spec.get("names", [])}
+        task_targets = {str(name).lower() for name in context.get("task_targets", [])}
         candidates: List[Tuple[float, Dict[str, Any]]] = []
         for entry in symbolic:
             for candidate in entry.get("candidates", []):
@@ -373,6 +444,11 @@ class PolicyReasoner:
                     continue
                 distance = float(candidate.get("distance", 1.0))
                 heur_score = self._score_candidate(distance=distance, similarity=score)
+                # prefer task targets
+                if isinstance(name, str) and name.lower() in task_targets:
+                    heur_score += 2.0
+                elif task_targets:
+                    heur_score -= 0.5
                 candidates.append((heur_score, {"action": "search", "target_name": name, "distance": distance}))
         if not candidates:
             return ReasonerPlan("search", None, None, 0.3, {"reason": "fallback"})

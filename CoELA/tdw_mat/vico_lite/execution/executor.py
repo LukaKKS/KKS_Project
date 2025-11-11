@@ -113,8 +113,19 @@ class PlanExecutor:
                         nav_meta,
                     )
                 return command, meta
-        command = {"type": 6, "id": plan.target_id}
-        meta["result"] = "attempt_pick"
+        target_id = plan.target_id
+        if target_id is None:
+            meta.update({"reason": "missing_target_id"})
+            return {"type": "ongoing"}, meta
+        holding_slots = agent_state.get("holding_slots", {}) if isinstance(agent_state, dict) else {}
+        left_busy = holding_slots.get("left") is not None
+        right_busy = holding_slots.get("right") is not None
+        if left_busy and right_busy:
+            meta.update({"reason": "hands_full"})
+            return {"type": "ongoing"}, meta
+        arm = "right" if left_busy and not right_busy else "left"
+        command = {"type": 3, "object": target_id, "arm": arm}
+        meta.update({"result": "attempt_pick", "arm": arm})
         if self.logger and getattr(self.logger, "debug", None):
             self.logger.debug("[Executor] issuing pick command=%s meta=%s", command, meta)
         return command, meta

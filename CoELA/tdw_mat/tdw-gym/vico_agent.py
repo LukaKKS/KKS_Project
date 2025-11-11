@@ -93,6 +93,7 @@ class ViCoAgent:
             device=self.device,
         )
         self.policy.reset()
+        self.policy.set_goal_context(goal_objects=self.goal_objects, rooms_name=self.rooms_name)
         self.agent_memory.update(obs, save_img=self.save_img)
 
     def act(self, obs: Dict[str, Any]) -> Dict[str, Any]:

@@ -17,6 +17,8 @@ class SharedStateSnapshot:
     per_agent_symbolic: Dict[int, List[Dict[str, object]]] = field(default_factory=dict)
     team_symbolic: List[Dict[str, object]] = field(default_factory=list)
     agent_id: Optional[int] = None
+    skip_targets: Dict[str, List] = field(default_factory=dict)
+    nav_guard_info: Dict[Tuple[float, float], int] = field(default_factory=dict)
 
 
 class SharedMemory:

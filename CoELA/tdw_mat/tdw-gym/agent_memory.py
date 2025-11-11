@@ -522,6 +522,11 @@ class AgentMemory():
             raise ValueError("Goal format not supported!")
         st_i, st_j = self.pos2map(st_x, st_z)
         g_i, g_j = self.pos2map(g_x, g_z)
+        height, width = self.local_occupancy_map.shape
+        st_i = int(np.clip(st_i, 0, height - 1))
+        st_j = int(np.clip(st_j, 0, width - 1))
+        g_i = int(np.clip(g_i, 0, height - 1))
+        g_j = int(np.clip(g_j, 0, width - 1))
         dist_map = np.ones_like(self.local_occupancy_map, dtype=np.float32)
         super_map1 = self.conv2d(self.local_occupancy_map, kernel=5)
         dist_map[super_map1 > 0] = 5

@@ -28,9 +28,10 @@ GENERAL RULES:
 1. Do NOT wrap the JSON in markdown code fences or add prose before/after the JSON.
 2. Every candidate listed must follow the schema exactly. Missing fields are forbidden.
 3. Numeric fields must be numbers (not strings). Use at most two decimal places when necessary.
-4. Respect skip-target constraints:
-   - skip_targets.names lists object names (case-insensitive) that must be avoided.
-   - skip_targets.coords lists [x, z] world coordinates (meters). Do not target these positions.
+4. Respect skip-target constraints as HARD bans:
+   - skip_targets.names lists object names (case-insensitive) that must be avoided. Never return a candidate matching them.
+   - skip_targets.coords lists [x, z] world coordinates (meters). Do not target these positions or anything closer than 0.5m to them.
+   - nav_guard_info entries are temporary guard-locked coordinates; treat them as blocked until their cooldown expires.
 5. Use the supplied scene bounds (if present) to keep target_pos within the valid map area.
 6. Provide at most 5 candidates, ordered best-first according to your reasoning.
 
