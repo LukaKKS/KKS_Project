@@ -1,0 +1,6 @@
+.env
+results/
+CoELA/tdw_mat/results/
+__pycache__/
+*.pyc
+action*.log
