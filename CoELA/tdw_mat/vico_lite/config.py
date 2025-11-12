@@ -90,7 +90,7 @@ class ViCoConfig:
     memory_max_history: int = 50
 
     # Navigation
-    navigation_guard_ratio: float = 1.25
+    navigation_guard_ratio: float = 1.8
 
     # Logging
     log_json_pretty: bool = False

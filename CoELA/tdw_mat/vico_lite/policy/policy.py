@@ -51,6 +51,7 @@ class ViCoPolicy:
         self.active_target: Optional[Tuple[float, float, float]] = None
         self.target_acquire_frame: int = -999
         self._common_sense = self._load_common_sense()
+        self._name_map = self._load_name_map()
         self._task_target_lookup: Set[str] = set()
         self._task_container_lookup: Set[str] = set()
         self._grabbable_lookup: Set[str] = set()
@@ -113,17 +114,22 @@ class ViCoPolicy:
                     best_type = candidate
             selected_type = best_type or "food"
         task_payload = knowledge.get(selected_type, {})
-        target_lookup = {
-            str(n).lower() for n in task_payload.get("target", [])
-        }
-        container_lookup = {
-            str(n).lower() for n in task_payload.get("container", [])
-        }
-        grabbable_lookup = {
-            str(n).lower() for n in knowledge.get("floor_objects", [])
-        }
-        if not grabbable_lookup:
-            grabbable_lookup = target_lookup | container_lookup
+        target_raw = {str(n).lower() for n in task_payload.get("target", [])}
+        container_raw = {str(n).lower() for n in task_payload.get("container", [])}
+        grabbable_raw = {str(n).lower() for n in knowledge.get("floor_objects", [])}
+        if not grabbable_raw:
+            grabbable_raw = target_raw | container_raw
+        def _expand_with_mapping(names: Set[str]) -> Set[str]:
+            expanded = set()
+            for raw_name in names:
+                expanded.add(raw_name)
+                mapped = self._name_map.get(raw_name, raw_name).lower()
+                if mapped != raw_name:
+                    expanded.add(mapped)
+            return expanded
+        target_lookup = _expand_with_mapping(target_raw)
+        container_lookup = _expand_with_mapping(container_raw)
+        grabbable_lookup = _expand_with_mapping(grabbable_raw)
         self._task_target_lookup = target_lookup
         self._task_container_lookup = container_lookup
         self._grabbable_lookup = grabbable_lookup
@@ -246,11 +252,65 @@ class ViCoPolicy:
         self.agent_state["heuristic_streak"] = streak
         override_used = False
         plan = guidance.plan
+        holding_ids = self.agent_state.get("holding_ids", [])
+        if holding_ids:
+            if self.logger:
+                self.logger.debug(
+                    "[Policy] frame=%s holding_ids=%s checking for deliver",
+                    frame,
+                    holding_ids,
+                )
+            if plan is None or plan.action_type != "deliver":
+                deliver_plan = self._maybe_force_deliver(visible_infos)
+                if deliver_plan is not None:
+                    plan = deliver_plan
+                    override_used = True
+                    if self.logger:
+                        self.logger.info(
+                            "[Policy] frame=%s overriding with deliver id=%s name=%s dist=%.2f",
+                            frame,
+                            deliver_plan.target_id,
+                            deliver_plan.meta.get("target_name", "?"),
+                            deliver_plan.meta.get("distance", -1.0),
+                        )
+                elif self.logger:
+                    self.logger.debug(
+                        "[Policy] frame=%s _maybe_force_deliver returned None",
+                        frame,
+                    )
         if plan is None or plan.action_type != "pick":
-            override_plan = self._maybe_force_pick(visible_infos)
-            if override_plan is not None:
-                plan = override_plan
-                override_used = True
+            if self.logger and visible_infos:
+                grabbable_count = sum(1 for info in visible_infos if info.get("is_grabbable"))
+                close_count = sum(1 for info in visible_infos if info.get("is_grabbable") and info.get("distance") is not None and float(info.get("distance", 999)) <= (4.5 if info.get("is_task_target") else 3.0))
+                grabbable_names = [info.get("name", "?") for info in visible_infos if info.get("is_grabbable")][:5]
+                if grabbable_count == 0 and len(visible_infos) > 0:
+                    sample_names = [info.get("name", "?") for info in visible_infos[:5]]
+                    sample_mapped = [info.get("name_mapped", "?") for info in visible_infos[:5]]
+                    self.logger.debug(
+                        "[Policy] frame=%s force_pick_check visible=%s grabbable=0 sample_names=%s sample_mapped=%s grabbable_lookup_size=%s",
+                        frame,
+                        len(visible_infos),
+                        sample_names,
+                        sample_mapped,
+                        len(self._grabbable_lookup),
+                    )
+                else:
+                    self.logger.debug(
+                        "[Policy] frame=%s force_pick_check visible=%s grabbable=%s close=%s holding=%s names=%s",
+                        frame,
+                        len(visible_infos),
+                        grabbable_count,
+                        close_count,
+                        len(holding_ids),
+                        grabbable_names,
+                    )
+            if not override_used:
+                override_plan = self._maybe_force_pick(visible_infos)
+                if override_plan is not None:
+                    plan = override_plan
+                    override_used = True
+                elif self.logger and visible_infos:
+                    self.logger.debug("[Policy] frame=%s force_pick returned None", frame)
         if plan is None:
             plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "no_plan"})
         plan = self._ensure_plan_target(plan)
@@ -321,17 +381,40 @@ class ViCoPolicy:
                 agent_pos = None
         object_infos = []
         for item in visible:
+            obj_id = item.get("id")
+            obj_name = item.get("name")
+            if obj_id is None:
+                continue
+            if obj_name is None or (isinstance(obj_name, str) and obj_name.strip() == ""):
+                continue
             info: Dict[str, Any] = {
-                "id": item.get("id"),
-                "name": item.get("name", ""),
+                "id": obj_id,
+                "name": obj_name,
                 "category": item.get("category"),
                 "visible": item.get("visible", True),
             }
             position = item.get("position", None)
+            location = item.get("location", None)
+            if position is None and location is None:
+                if hasattr(self.agent_memory, "get_object_position"):
+                    try:
+                        position = self.agent_memory.get_object_position(obj_id)
+                        if position is not None:
+                            position = list(position) if isinstance(position, (list, tuple, np.ndarray)) else position
+                    except (KeyError, AttributeError, Exception):
+                        pass
+                if position is None and hasattr(self.agent_memory, "object_info") and obj_id in getattr(self.agent_memory, "object_info", {}):
+                    try:
+                        obj_info = self.agent_memory.object_info[obj_id]
+                        position = obj_info.get("position")
+                        if position is not None:
+                            position = list(position) if isinstance(position, (list, tuple, np.ndarray)) else position
+                    except (KeyError, AttributeError, Exception):
+                        pass
             if position is None:
-                position = item.get("location")
+                position = location
+            obj_pos: Optional[np.ndarray] = None
             if position is not None:
-                obj_pos: Optional[np.ndarray] = None
                 try:
                     obj_pos = np.asarray(position, dtype=np.float32)
                 except Exception:
@@ -342,20 +425,32 @@ class ViCoPolicy:
                     info["position"] = list(position)
                 else:
                     info["position"] = position
-                if agent_pos is not None and obj_pos is not None:
-                    try:
-                        if agent_pos.shape[0] >= 3 and obj_pos.shape[0] >= 3:
-                            info["distance"] = float(np.linalg.norm(agent_pos[[0, 2]] - obj_pos[[0, 2]]))
-                        else:
-                            info["distance"] = float(np.linalg.norm(agent_pos - obj_pos))
-                    except Exception:
-                        pass
+            if location is not None and "position" not in info:
+                if isinstance(location, np.ndarray):
+                    info["location"] = location.tolist()
+                elif isinstance(location, (list, tuple)):
+                    info["location"] = list(location)
+                else:
+                    info["location"] = location
+            if agent_pos is not None and obj_pos is not None:
+                try:
+                    if agent_pos.shape[0] >= 3 and obj_pos.shape[0] >= 3:
+                        info["distance"] = float(np.linalg.norm(agent_pos[[0, 2]] - obj_pos[[0, 2]]))
+                    else:
+                        info["distance"] = float(np.linalg.norm(agent_pos - obj_pos))
+                except Exception:
+                    pass
             if "distance" not in info and item.get("distance") is not None:
                 try:
                     info["distance"] = float(item.get("distance"))
                 except Exception:
                     pass
-            name_lc = str(info.get("name", "")).lower()
+            raw_name = str(info.get("name", "")).lower()
+            if raw_name in ("none", "null", ""):
+                continue
+            mapped_name = self._name_map.get(raw_name, raw_name).lower()
+            name_lc = mapped_name
+            info["name_mapped"] = mapped_name
             info["is_task_target"] = name_lc in self._task_target_lookup
             info["is_task_container"] = name_lc in self._task_container_lookup
             info["is_grabbable"] = name_lc in self._grabbable_lookup or info["is_task_target"]
@@ -541,6 +636,24 @@ class ViCoPolicy:
         )
 
     # ------------------------------------------------------------------
+    def _load_name_map(self) -> Dict[str, str]:
+        candidate_paths = [
+            os.path.join(os.path.dirname(__file__), "..", "..", "dataset", "name_map.json"),
+            os.path.join(os.getcwd(), "CoELA", "tdw_mat", "dataset", "name_map.json"),
+            os.path.join(os.getcwd(), "dataset", "name_map.json"),
+        ]
+        for path in candidate_paths:
+            norm = os.path.abspath(path)
+            if os.path.exists(norm):
+                try:
+                    with open(norm, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                        return {str(k).lower(): str(v).lower() for k, v in data.items()}
+                except Exception as exc:
+                    if self.logger:
+                        self.logger.warning("[Policy] failed to load name_map from %s (%s)", norm, exc)
+        return {}
+
     def _load_common_sense(self) -> Dict[str, Any]:
         candidate_paths = [
             os.path.join(os.path.dirname(__file__), "..", "..", "dataset", "list.json"),
@@ -560,32 +673,64 @@ class ViCoPolicy:
 
     def _maybe_force_pick(self, object_infos: List[Dict[str, Any]]) -> Optional[ReasonedPlan]:
         if not object_infos:
+            if self.logger:
+                self.logger.debug("[Policy] _maybe_force_pick: no object_infos")
             return None
         if self.agent_state.get("holding_ids"):
+            if self.logger:
+                self.logger.debug("[Policy] _maybe_force_pick: already holding objects")
             return None
+        agent_pos = None
+        if hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
+            try:
+                agent_pos = np.asarray(self.agent_memory.position, dtype=np.float32)
+            except Exception:
+                pass
         blocked_coords = self._skip_coords().union(self.agent_state.get("nav_guard_coords", set()))
         skip_names = {
             str(name).lower()
             for name in self.agent_state.get("skip_targets", {}).get("names", set())
         }
         candidates: List[Tuple[float, Dict[str, Any]]] = []
+        filtered_reasons: Dict[str, int] = {}
         for info in object_infos:
             if not info.get("is_grabbable"):
+                filtered_reasons["not_grabbable"] = filtered_reasons.get("not_grabbable", 0) + 1
                 continue
             if info.get("id") is None:
+                filtered_reasons["no_id"] = filtered_reasons.get("no_id", 0) + 1
                 continue
             position = self._normalise_position(info.get("position"))
             if position is None:
-                continue
+                position = self._normalise_position(info.get("location"))
+                if position is None:
+                    filtered_reasons["no_position"] = filtered_reasons.get("no_position", 0) + 1
+                    continue
             if info.get("distance") is None:
-                continue
+                if position is not None and agent_pos is not None:
+                    try:
+                        pos_arr = np.asarray(position, dtype=np.float32)
+                        if pos_arr.shape[0] >= 3 and agent_pos.shape[0] >= 3:
+                            info["distance"] = float(np.linalg.norm(agent_pos[[0, 2]] - pos_arr[[0, 2]]))
+                        else:
+                            info["distance"] = float(np.linalg.norm(agent_pos - pos_arr))
+                    except Exception:
+                        filtered_reasons["no_distance"] = filtered_reasons.get("no_distance", 0) + 1
+                        continue
+                else:
+                    filtered_reasons["no_distance"] = filtered_reasons.get("no_distance", 0) + 1
+                    continue
             distance = float(info["distance"])
-            if not np.isfinite(distance) or distance > 1.6:
+            max_distance = 4.5 if info.get("is_task_target") else 3.0
+            if not np.isfinite(distance) or distance > max_distance:
+                filtered_reasons["too_far"] = filtered_reasons.get("too_far", 0) + 1
                 continue
             if self._is_blocked_position(position, blocked_coords, radius=0.4):
+                filtered_reasons["blocked"] = filtered_reasons.get("blocked", 0) + 1
                 continue
             name_lc = str(info.get("name", "")).lower()
             if name_lc in skip_names:
+                filtered_reasons["skip_name"] = filtered_reasons.get("skip_name", 0) + 1
                 continue
             priority = info.get("priority", 0.0)
             if info.get("is_task_target"):
@@ -593,6 +738,11 @@ class ViCoPolicy:
             score = priority - distance
             candidates.append((score, info))
         if not candidates:
+            if self.logger and filtered_reasons:
+                self.logger.debug(
+                    "[Policy] _maybe_force_pick: no candidates filtered_reasons=%s",
+                    filtered_reasons,
+                )
             return None
         candidates.sort(key=lambda item: item[0], reverse=True)
         best_info = candidates[0][1]
@@ -614,6 +764,97 @@ class ViCoPolicy:
                 best_info.get("distance", -1.0),
             )
         return ReasonedPlan("pick", target_id, target_pos, confidence, meta)
+
+    def _maybe_force_deliver(self, object_infos: List[Dict[str, Any]]) -> Optional[ReasonedPlan]:
+        """Force a deliver action if holding objects and a nearby container is visible."""
+        holding_ids = self.agent_state.get("holding_ids", [])
+        if not holding_ids:
+            return None
+        agent_pos = None
+        if hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
+            try:
+                agent_pos = np.asarray(self.agent_memory.position, dtype=np.float32)
+            except Exception:
+                pass
+        if agent_pos is None:
+            return None
+        skip_targets = self.agent_state.get("skip_targets", {"names": set(), "coords": set()})
+        skip_names = {str(n).lower() for n in skip_targets.get("names", [])}
+        blocked_coords = set()
+        for coord in skip_targets.get("coords", []):
+            if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+                blocked_coords.add((round(float(coord[0]), 2), round(float(coord[2]), 2)))
+        candidates = []
+        filtered_reasons = {}
+        for info in object_infos:
+            if not info.get("is_task_container", False):
+                filtered_reasons["not_container"] = filtered_reasons.get("not_container", 0) + 1
+                continue
+            container_id = info.get("id")
+            if container_id is None:
+                filtered_reasons["no_id"] = filtered_reasons.get("no_id", 0) + 1
+                continue
+            position = self._normalise_position(info.get("position"))
+            if position is None:
+                position = self._normalise_position(info.get("location"))
+            if position is None:
+                filtered_reasons["no_position"] = filtered_reasons.get("no_position", 0) + 1
+                continue
+            if info.get("distance") is None:
+                if position is not None and agent_pos is not None:
+                    try:
+                        pos_arr = np.asarray(position, dtype=np.float32)
+                        if pos_arr.shape[0] >= 3 and agent_pos.shape[0] >= 3:
+                            info["distance"] = float(np.linalg.norm(agent_pos[[0, 2]] - pos_arr[[0, 2]]))
+                        else:
+                            info["distance"] = float(np.linalg.norm(agent_pos - pos_arr))
+                    except Exception:
+                        filtered_reasons["no_distance"] = filtered_reasons.get("no_distance", 0) + 1
+                        continue
+                else:
+                    filtered_reasons["no_distance"] = filtered_reasons.get("no_distance", 0) + 1
+                    continue
+            distance = float(info["distance"])
+            max_distance = 5.0
+            if not np.isfinite(distance) or distance > max_distance:
+                filtered_reasons["too_far"] = filtered_reasons.get("too_far", 0) + 1
+                continue
+            if self._is_blocked_position(position, blocked_coords, radius=0.4):
+                filtered_reasons["blocked"] = filtered_reasons.get("blocked", 0) + 1
+                continue
+            name_lc = str(info.get("name", "")).lower()
+            if name_lc in skip_names:
+                filtered_reasons["skip_name"] = filtered_reasons.get("skip_name", 0) + 1
+                continue
+            score = 5.0 - distance
+            candidates.append((score, info))
+        if not candidates:
+            if self.logger and filtered_reasons:
+                self.logger.debug(
+                    "[Policy] _maybe_force_deliver: no candidates filtered_reasons=%s",
+                    filtered_reasons,
+                )
+            return None
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        best_info = candidates[0][1]
+        target_id = best_info.get("id")
+        target_pos = self._normalise_position(best_info.get("position"))
+        if target_id is None or target_pos is None:
+            return None
+        meta = {
+            "reason": "policy_override_deliver",
+            "target_name": best_info.get("name"),
+            "distance": best_info.get("distance"),
+        }
+        confidence = 0.9
+        if self.logger:
+            self.logger.info(
+                "[Policy] overriding with deliver id=%s name=%s dist=%.2f",
+                target_id,
+                best_info.get("name"),
+                best_info.get("distance", -1.0),
+            )
+        return ReasonedPlan("deliver", target_id, target_pos, confidence, meta)
 
     @staticmethod
     def _normalise_position(position: Any) -> Optional[Tuple[float, float, float]]:

@@ -103,7 +103,9 @@ class PlanExecutor:
     def _approach_and_pick(self, plan, agent_state):
         target_pos = plan.target_position
         meta = {"navigation": "pick"}
-        if target_pos is not None:
+        is_force_pick = plan.meta.get("override") == "near_grabbable" or plan.meta.get("reason") == "policy_override_grabbable"
+        force_pick_distance = plan.meta.get("distance")
+        if target_pos is not None and not is_force_pick:
             command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True)
             meta.update(nav_meta)
             if nav_meta.get("forced_failure"):
@@ -113,6 +115,25 @@ class PlanExecutor:
                         nav_meta,
                     )
                 return command, meta
+        elif target_pos is not None and is_force_pick:
+            if force_pick_distance is not None and force_pick_distance <= 2.0:
+                if self.logger:
+                    self.logger.info(
+                        "[Executor] force_pick: skipping navigation (dist=%.2f <= 2.0m), attempting direct pick",
+                        force_pick_distance,
+                    )
+                meta["navigation"] = "skip_direct_pick"
+                meta["distance"] = force_pick_distance
+            else:
+                command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True)
+                meta.update(nav_meta)
+                if nav_meta.get("forced_failure"):
+                    if self.logger:
+                        self.logger.info(
+                            "[Executor] force_pick: guard triggered but proceeding anyway (dist=%.2f)",
+                            nav_meta.get("distance", -1),
+                        )
+                    meta["guard_ignored"] = True
         target_id = plan.target_id
         if target_id is None:
             meta.update({"reason": "missing_target_id"})
@@ -151,14 +172,24 @@ class PlanExecutor:
         return {key: value["frames"] for key, value in self._guard_skip.items()}
 
     def _clamp_target(self, target_pos):
-        if self.agent_memory is None or not hasattr(self.agent_memory, "_scene_bounds"):
-            return target_pos
-        bounds = getattr(self.agent_memory, "_scene_bounds", None)
-        if not bounds:
+        if self.agent_memory is None:
             return target_pos
         x, y, z = target_pos
-        clamped_x = min(max(x, bounds.get("x_min", x)), bounds.get("x_max", x))
-        clamped_z = min(max(z, bounds.get("z_min", z)), bounds.get("z_max", z))
+        clamped_x, clamped_z = x, z
+        if hasattr(self.agent_memory, "_scene_bounds"):
+            bounds = getattr(self.agent_memory, "_scene_bounds", None)
+            if bounds:
+                clamped_x = min(max(x, bounds.get("x_min", x)), bounds.get("x_max", x))
+                clamped_z = min(max(z, bounds.get("z_min", z)), bounds.get("z_max", z))
+        if self.env_api and "check_pos_in_room" in self.env_api:
+            if not self.env_api["check_pos_in_room"]((clamped_x, clamped_z)):
+                if hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
+                    agent_pos = self.agent_memory.position
+                    clamped_x = agent_pos[0] if abs(clamped_x - agent_pos[0]) > 10 else clamped_x
+                    clamped_z = agent_pos[2] if abs(clamped_z - agent_pos[2]) > 10 else clamped_z
+                else:
+                    clamped_x = 0.0
+                    clamped_z = 0.0
         if clamped_x != x or clamped_z != z:
             if self.logger and getattr(self.logger, "debug", None):
                 self.logger.debug(
