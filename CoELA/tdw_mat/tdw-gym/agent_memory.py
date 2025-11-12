@@ -165,6 +165,9 @@ class AgentMemory():
     
     def update(self, obs, ignore_ids = [], ignore_obstacles = [], save_img = False):
         self.obs = obs
+        # Reset logged colors and failed objects cache for this frame
+        self._logged_colors = set()
+        self._logged_failed_objects = set()
         self.ignore_logic(self.obs['current_frames'], ignore_ids, ignore_obstacles)
         self.local_step += 1
         self.get_object_list()
@@ -218,7 +221,36 @@ class AgentMemory():
     
     def get_pc(self, color) -> np.ndarray:
         depth = self.obs['depth'].copy()
-        mask = np.any(self.obs['seg_mask'] != color, axis=-1)
+        seg_mask = self.obs['seg_mask']
+        
+        # Convert color to numpy array for comparison
+        if isinstance(color, (tuple, list)):
+            color = np.array(color, dtype=seg_mask.dtype)
+        
+        # Handle different seg_mask shapes: (H, W, 3) or (H, W)
+        if seg_mask.ndim == 3:
+            # (H, W, 3) format - compare along last axis
+            mask = np.any(seg_mask != color, axis=-1)
+        elif seg_mask.ndim == 2:
+            # (H, W) format - might be grayscale, need to check
+            # If color is 3D, we can't match directly - log warning
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.warning(
+                    "[AgentMemory] get_pc: seg_mask is 2D but color is 3D: seg_mask_shape=%s color=%s",
+                    seg_mask.shape,
+                    color,
+                )
+            # Try to match by converting to single value (not ideal but might work)
+            mask = seg_mask != color[0] if len(color) > 0 else np.ones_like(seg_mask, dtype=bool)
+        else:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.warning(
+                    "[AgentMemory] get_pc: unexpected seg_mask shape: %s color=%s",
+                    seg_mask.shape,
+                    color,
+                )
+            mask = np.ones_like(depth, dtype=bool)
+        
         depth[mask] = 1e9
         # Camera info
         FOV = self.obs['FOV']
@@ -236,10 +268,61 @@ class AgentMemory():
         xx = (xx - cx) / fx * depth
         yy = (yy - cy) / fy * depth
 
-        index = np.where((depth > 0) & (depth < 10))
+        # Relax depth constraint: allow objects up to 20m away (was 10m)
+        # This helps with objects that are further but still visible
+        index = np.where((depth > 0) & (depth < 20))
+        valid_count = len(index[0])
+        
+        # Log detailed info if too few points (only for debugging, reduce log spam)
+        # Use a cache to log each color only once per frame
+        # Relaxed threshold: log if less than 3 points (was 5)
+        if valid_count < 3:
+            # Check how many pixels match the color
+            if seg_mask.ndim == 3:
+                color_match = np.all(seg_mask == color, axis=-1)
+                matched_pixels = np.sum(color_match)
+            else:
+                matched_pixels = -1
+            
+            # Only log if this color hasn't been logged in this frame
+            if hasattr(self, 'logger') and self.logger:
+                # Use DEBUG level instead of WARNING to reduce log spam
+                # Only log if matched_pixels > 0 (object is visible but depth is invalid)
+                if matched_pixels > 0 and hasattr(self, '_logged_colors'):
+                    color_key = tuple(color) if isinstance(color, np.ndarray) else color
+                    if color_key not in self._logged_colors:
+                        depth_valid = depth[(depth > 0) & (depth < 10)]
+                        self.logger.debug(
+                            "[AgentMemory] get_pc: too few valid points color=%s valid_count=%d matched_pixels=%d depth_range=[%.2f, %.2f]",
+                            color,
+                            valid_count,
+                            matched_pixels,
+                            depth_valid.min() if len(depth_valid) > 0 else -1,
+                            depth_valid.max() if len(depth_valid) > 0 else -1,
+                        )
+                        self._logged_colors.add(color_key)
+                elif matched_pixels > 0:
+                    # Initialize cache if not exists
+                    if not hasattr(self, '_logged_colors'):
+                        self._logged_colors = set()
+                    color_key = tuple(color) if isinstance(color, np.ndarray) else color
+                    depth_valid = depth[(depth > 0) & (depth < 10)]
+                    self.logger.debug(
+                        "[AgentMemory] get_pc: too few valid points color=%s valid_count=%d matched_pixels=%d depth_range=[%.2f, %.2f]",
+                        color,
+                        valid_count,
+                        matched_pixels,
+                        depth_valid.min() if len(depth_valid) > 0 else -1,
+                        depth_valid.max() if len(depth_valid) > 0 else -1,
+                    )
+                    self._logged_colors.add(color_key)
+        
         xx = xx[index].copy().reshape(-1)
         yy = yy[index].copy().reshape(-1)
         depth = depth[index].copy().reshape(-1)
+        
+        if len(xx) == 0:
+            return None
         
         pc = np.stack((xx, yy, depth, np.ones_like(xx)))
         
@@ -256,12 +339,39 @@ class AgentMemory():
         return rpc[:3]
     
     def cal_object_position(self, o_dict):
-        pc = self.get_pc(o_dict['seg_color'])
-        if pc.shape[1] < 5:
+        try:
+            seg_color = o_dict['seg_color']
+            pc = self.get_pc(seg_color)
+            # Relax minimum point requirement: allow 3 points instead of 5
+            # This helps with small objects or objects with partial visibility
+            if pc is None or pc.shape[1] < 3:
+                # Log why it failed (only once per object per frame to reduce log spam)
+                obj_id = o_dict.get('id')
+                if hasattr(self, 'logger') and self.logger:
+                    # Use a cache to log each object only once per frame
+                    if not hasattr(self, '_logged_failed_objects'):
+                        self._logged_failed_objects = set()
+                    if obj_id not in self._logged_failed_objects:
+                        self.logger.debug(
+                            "[AgentMemory] cal_object_position failed: id=%s name=%s pc_shape=%s",
+                            obj_id,
+                            o_dict.get('name'),
+                            pc.shape if pc is not None else None,
+                        )
+                        self._logged_failed_objects.add(obj_id)
+                return None, None
+            
+            position = pc.mean(1)
+            return position[:3], pc
+        except Exception as exc:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.warning(
+                    "[AgentMemory] cal_object_position exception: id=%s name=%s error=%s",
+                    o_dict.get('id'),
+                    o_dict.get('name'),
+                    exc,
+                )
             return None, None
-        
-        position = pc.mean(1)
-        return position[:3], pc
     
     def get_object_list(self):
         self.oppo_this_step = False

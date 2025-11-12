@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
+
 from ..config import ViCoConfig
 
 LOGGER = logging.getLogger(__name__)
@@ -66,7 +68,35 @@ class PlanExecutor:
         if self.agent_memory is None:
             meta["reason"] = "no_agent_memory"
             return {"type": "ongoing"}, meta
+        
+        # Clamp target to map boundaries (this already handles check_pos_in_room)
+        original_target = target_pos
         target_pos = self._clamp_target(target_pos)
+        
+        # Final validation: if target is still outside room after clamping, reject it
+        if self.env_api and "check_pos_in_room" in self.env_api:
+            if not self.env_api["check_pos_in_room"]((target_pos[0], target_pos[2])):
+                # Target is still outside room, use agent's current position
+                if hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
+                    try:
+                        agent_pos = self.agent_memory.position
+                        if isinstance(agent_pos, (list, tuple, np.ndarray)) and len(agent_pos) >= 3:
+                            target_pos = (float(agent_pos[0]), float(agent_pos[1]), float(agent_pos[2]))
+                            meta["reason"] = "target_outside_room_using_agent_pos"
+                            # Verify agent position is valid
+                            if not self.env_api["check_pos_in_room"]((target_pos[0], target_pos[2])):
+                                meta["reason"] = "target_outside_room_agent_pos_invalid"
+                                return {"type": "ongoing"}, meta
+                        else:
+                            meta["reason"] = "target_outside_room_invalid"
+                            return {"type": "ongoing"}, meta
+                    except Exception:
+                        meta["reason"] = "target_outside_room_error"
+                        return {"type": "ongoing"}, meta
+                else:
+                    meta["reason"] = "target_outside_room_no_agent_pos"
+                    return {"type": "ongoing"}, meta
+        
         if hasattr(self.agent_memory, "belongs_to_which_room"):
             room = self.agent_memory.belongs_to_which_room(target_pos)
             if room is None and hasattr(self.agent_memory, "center_of_room"):
@@ -105,18 +135,20 @@ class PlanExecutor:
         meta = {"navigation": "pick"}
         is_force_pick = plan.meta.get("override") == "near_grabbable" or plan.meta.get("reason") == "policy_override_grabbable"
         force_pick_distance = plan.meta.get("distance")
-        if target_pos is not None and not is_force_pick:
-            command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True)
-            meta.update(nav_meta)
-            if nav_meta.get("forced_failure"):
-                if self.logger and getattr(self.logger, "debug", None):
-                    self.logger.debug(
-                        "[Executor] pick aborted due to guard meta=%s",
-                        nav_meta,
-                    )
-                return command, meta
-        elif target_pos is not None and is_force_pick:
-            if force_pick_distance is not None and force_pick_distance <= 2.0:
+        
+        # Reject invalid positions (0,0,0 is likely a default/placeholder)
+        if target_pos is not None and (target_pos == (0.0, 0.0, 0.0) or (abs(target_pos[0]) < 0.01 and abs(target_pos[2]) < 0.01)):
+            if self.logger:
+                self.logger.warning(
+                    "[Executor] rejecting pick with invalid target_pos (0,0,0): target_id=%s",
+                    plan.target_id,
+                )
+            meta.update({"reason": "invalid_target_position"})
+            return {"type": "ongoing"}, meta
+        
+        # Navigate if target_pos is available
+        if target_pos is not None:
+            if is_force_pick and force_pick_distance is not None and force_pick_distance <= 2.0:
                 if self.logger:
                     self.logger.info(
                         "[Executor] force_pick: skipping navigation (dist=%.2f <= 2.0m), attempting direct pick",
@@ -124,7 +156,17 @@ class PlanExecutor:
                     )
                 meta["navigation"] = "skip_direct_pick"
                 meta["distance"] = force_pick_distance
-            else:
+            elif not is_force_pick:
+                command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True)
+                meta.update(nav_meta)
+                if nav_meta.get("forced_failure"):
+                    if self.logger and getattr(self.logger, "debug", None):
+                        self.logger.debug(
+                            "[Executor] pick aborted due to guard meta=%s",
+                            nav_meta,
+                        )
+                    return command, meta
+            else:  # is_force_pick and distance > 2.0
                 command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True)
                 meta.update(nav_meta)
                 if nav_meta.get("forced_failure"):
@@ -134,10 +176,53 @@ class PlanExecutor:
                             nav_meta.get("distance", -1),
                         )
                     meta["guard_ignored"] = True
+        else:
+            # target_pos is None: allow pick attempt if distance is close enough
+            if is_force_pick and force_pick_distance is not None and force_pick_distance <= 2.5:
+                if self.logger:
+                    self.logger.info(
+                        "[Executor] force_pick: no position but distance=%.2f <= 2.5m, attempting direct pick",
+                        force_pick_distance,
+                    )
+                meta["navigation"] = "skip_no_position"
+                meta["distance"] = force_pick_distance
+                meta["note"] = "pick_without_position"
+            else:
+                # Position is None and distance is too far or unknown
+                if self.logger:
+                    self.logger.debug(
+                        "[Executor] pick: target_pos is None and distance=%.2f, skipping pick",
+                        force_pick_distance if force_pick_distance is not None else -1.0,
+                    )
+                meta.update({"reason": "no_position_and_too_far"})
+                return {"type": "ongoing"}, meta
+        
+        # Now attempt pick
         target_id = plan.target_id
         if target_id is None:
             meta.update({"reason": "missing_target_id"})
             return {"type": "ongoing"}, meta
+        
+        # Check if object_id exists in agent_memory.object_info (to prevent KeyError in tdw_gym)
+        # This is a best-effort check since we can't directly access object_manager.transforms
+        if self.agent_memory is not None and hasattr(self.agent_memory, "object_info"):
+            try:
+                if int(target_id) not in self.agent_memory.object_info:
+                    if self.logger:
+                        self.logger.warning(
+                            "[Executor] object_id=%s not in agent_memory.object_info, skipping pick (may cause KeyError)",
+                            target_id,
+                        )
+                    meta.update({"reason": "object_not_in_memory"})
+                    return {"type": "ongoing"}, meta
+            except Exception as exc:
+                if self.logger:
+                    self.logger.debug(
+                        "[Executor] failed to check agent_memory.object_info for id=%s: %s",
+                        target_id,
+                        exc,
+                    )
+        
         holding_slots = agent_state.get("holding_slots", {}) if isinstance(agent_state, dict) else {}
         left_busy = holding_slots.get("left") is not None
         right_busy = holding_slots.get("right") is not None
@@ -175,21 +260,81 @@ class PlanExecutor:
         if self.agent_memory is None:
             return target_pos
         x, y, z = target_pos
+        
+        # Get agent's current position for fallback
+        agent_pos = None
+        agent_pos_full = None
+        if hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
+            try:
+                agent_pos_full = self.agent_memory.position
+                if isinstance(agent_pos_full, (list, tuple, np.ndarray)) and len(agent_pos_full) >= 3:
+                    agent_pos = (float(agent_pos_full[0]), float(agent_pos_full[2]))
+                else:
+                    agent_pos_full = None
+            except Exception:
+                agent_pos_full = None
+        
+        # First, try to clamp using scene_bounds with safety margin
         clamped_x, clamped_z = x, z
         if hasattr(self.agent_memory, "_scene_bounds"):
             bounds = getattr(self.agent_memory, "_scene_bounds", None)
             if bounds:
-                clamped_x = min(max(x, bounds.get("x_min", x)), bounds.get("x_max", x))
-                clamped_z = min(max(z, bounds.get("z_min", z)), bounds.get("z_max", z))
+                x_min = bounds.get("x_min")
+                x_max = bounds.get("x_max")
+                z_min = bounds.get("z_min")
+                z_max = bounds.get("z_max")
+                # Add safety margin (0.5m) to prevent going outside
+                margin = 0.5
+                if x_min is not None and x_max is not None:
+                    clamped_x = min(max(x, x_min + margin), x_max - margin)
+                if z_min is not None and z_max is not None:
+                    clamped_z = min(max(z, z_min + margin), z_max - margin)
+        
+        # Then, check if clamped position is in room
         if self.env_api and "check_pos_in_room" in self.env_api:
             if not self.env_api["check_pos_in_room"]((clamped_x, clamped_z)):
-                if hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
-                    agent_pos = self.agent_memory.position
-                    clamped_x = agent_pos[0] if abs(clamped_x - agent_pos[0]) > 10 else clamped_x
-                    clamped_z = agent_pos[2] if abs(clamped_z - agent_pos[2]) > 10 else clamped_z
+                # If not in room, use agent's current position
+                if agent_pos is not None:
+                    clamped_x, clamped_z = agent_pos
+                elif agent_pos_full is not None:
+                    try:
+                        if isinstance(agent_pos_full, (list, tuple, np.ndarray)) and len(agent_pos_full) >= 3:
+                            clamped_x = float(agent_pos_full[0])
+                            clamped_z = float(agent_pos_full[2])
+                        else:
+                            clamped_x = 0.0
+                            clamped_z = 0.0
+                    except Exception:
+                        clamped_x = 0.0
+                        clamped_z = 0.0
                 else:
                     clamped_x = 0.0
                     clamped_z = 0.0
+                # Verify the fallback position is valid
+                if self.env_api and "check_pos_in_room" in self.env_api:
+                    if not self.env_api["check_pos_in_room"]((clamped_x, clamped_z)):
+                        # Last resort: use (0, 0) if agent position is also invalid
+                        clamped_x = 0.0
+                        clamped_z = 0.0
+                        if self.logger:
+                            self.logger.warning(
+                                "[Executor] target %s outside room, resetting to (0, 0)",
+                                target_pos,
+                            )
+        
+        # Final safety check: ensure clamped position is within scene_bounds
+        if hasattr(self.agent_memory, "_scene_bounds"):
+            bounds = getattr(self.agent_memory, "_scene_bounds", None)
+            if bounds:
+                x_min = bounds.get("x_min")
+                x_max = bounds.get("x_max")
+                z_min = bounds.get("z_min")
+                z_max = bounds.get("z_max")
+                if x_min is not None and x_max is not None:
+                    clamped_x = min(max(clamped_x, x_min), x_max)
+                if z_min is not None and z_max is not None:
+                    clamped_z = min(max(clamped_z, z_min), z_max)
+        
         if clamped_x != x or clamped_z != z:
             if self.logger and getattr(self.logger, "debug", None):
                 self.logger.debug(

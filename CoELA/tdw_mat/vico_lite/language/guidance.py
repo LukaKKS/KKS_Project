@@ -89,7 +89,7 @@ class GuidanceController:
             "skip_targets": {"names": names, "coords": coords},
             "skip_targets_text": {"names": names, "coords": coord_strings},
         }
-        for key in ("task_type", "task_targets", "task_containers", "grabbable_names", "visible_objects", "goal_objects"):
+        for key in ("task_type", "task_targets", "task_containers", "grabbable_names", "visible_objects", "goal_objects", "scene_bounds"):
             value = agent_state.get(key)
             if value:
                 context[key] = value

@@ -80,6 +80,8 @@ class ViCoAgent:
             map_size=self.map_size,
             scene_bounds=self.scene_bounds,
         )
+        # Pass logger to agent_memory for debugging
+        self.agent_memory.logger = self.logger
         if self.shared_hub is not None:
             self.shared_hub.begin_episode(episode_index)
             self.shared_hub.register_agent(self.agent_id)

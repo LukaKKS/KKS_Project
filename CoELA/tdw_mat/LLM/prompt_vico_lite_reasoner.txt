@@ -32,7 +32,7 @@ GENERAL RULES:
    - skip_targets.names lists object names (case-insensitive) that must be avoided. Never return a candidate matching them.
    - skip_targets.coords lists [x, z] world coordinates (meters). Do not target these positions or anything closer than 0.5m to them.
    - nav_guard_info entries are temporary guard-locked coordinates; treat them as blocked until their cooldown expires.
-5. Use the supplied scene bounds (if present) to keep target_pos within the valid map area.
+5. CRITICAL: Map boundaries are STRICTLY enforced. If scene_bounds is provided (x_min, x_max, z_min, z_max), ALL target_pos coordinates MUST be within these bounds with a 1.0m safety margin. Targets outside will be automatically rejected and added to skip_targets. Keep all target_pos values strictly within: x in [x_min+1.0, x_max-1.0], z in [z_min+1.0, z_max-1.0]. If you see a coordinate in skip_targets.coords, NEVER use it or anything close to it (within 1.2m).
 6. Provide at most 5 candidates, ordered best-first according to your reasoning.
 
 ACTION GUIDELINES:
@@ -71,7 +71,8 @@ CONTEXT FIELDS YOU MAY SEE:
 - partner_symbolic: {"<agent_id>": [...] } — teammate observations tagged by agent id.
 - team_symbolic: combined symbolic list (each entry includes agent_id); use it for high-level coordination.
 - nav_guard_info: map of coordinates recently rejected by guard logic; avoid reusing them immediately.
-- skip_targets: {"names": [...], "coords": [[x, z], ...]} — strict do-not-target guidance shared by the team.
+- skip_targets: {"names": [...], "coords": [[x, z], ...]} — strict do-not-target guidance shared by the team. NEVER use coordinates in skip_targets.coords.
+- scene_bounds: {"x_min": float, "x_max": float, "z_min": float, "z_max": float} — MANDATORY map boundaries. ALL target_pos MUST be within these bounds. Targets outside will be automatically rejected.
 - current_room: room identifier if available.
 
 PLANNING ADVICE:

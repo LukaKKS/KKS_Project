@@ -150,6 +150,8 @@ class ViCoPolicy:
     # ------------------------------------------------------------------
     def act(self, obs: Dict[str, Any]) -> Dict[str, Any]:
         frame = int(obs.get("current_frames", 0))
+        # Reset logged failed objects cache for this frame
+        self._logged_cal_failed_objects = set()
         prev_status = obs.get("status")
         last_command = self.agent_state.get("last_command")
         if isinstance(prev_status, int) and last_command == "pick":
@@ -157,6 +159,16 @@ class ViCoPolicy:
             if prev_status == 1:
                 if self.logger:
                     self.logger.info("[Policy] pick success id=%s frame=%s", pick_id, frame)
+                # Add successfully picked object to skip_targets to prevent re-picking
+                if pick_id is not None:
+                    # Get object name from visible_objects or object_info
+                    obj_name = None
+                    if self.agent_memory is not None and hasattr(self.agent_memory, "object_info"):
+                        obj_info = self.agent_memory.object_info.get(pick_id)
+                        if obj_info:
+                            obj_name = obj_info.get("name")
+                    if obj_name:
+                        self._register_skip_target(name=obj_name)
             elif prev_status == 2:
                 if self.logger:
                     self.logger.warning("[Policy] pick failed id=%s frame=%s", pick_id, frame)
@@ -166,6 +178,13 @@ class ViCoPolicy:
             self.agent_state.pop("last_command", None)
             self.agent_state.pop("last_pick_id", None)
             self.agent_state.pop("last_pick_pos", None)
+        elif last_command == "pick" and self.logger:
+            self.logger.debug(
+                "[Policy] pick command pending: status=%s (type=%s) frame=%s",
+                prev_status,
+                type(prev_status).__name__,
+                frame,
+            )
         self.executor.tick()
         self._update_agent_state(obs)
         self.agent_state["frame"] = frame
@@ -174,6 +193,16 @@ class ViCoPolicy:
         snapshot = bridge_output["snapshot"]
         visible_infos = perception_input.get("object_infos", [])
         self.agent_state["last_visible_infos"] = visible_infos
+        if self.logger and getattr(self.logger, "debug", None):
+            grabbable_count = sum(1 for info in visible_infos if info.get("is_grabbable"))
+            task_target_count = sum(1 for info in visible_infos if info.get("is_task_target"))
+            self.logger.debug(
+                "[Policy] frame=%s visible_infos: total=%s grabbable=%s task_targets=%s",
+                frame,
+                len(visible_infos),
+                grabbable_count,
+                task_target_count,
+            )
         guard_summary = self.executor.guard_summary()
         guard_keys = set()
         for key in guard_summary.keys():
@@ -184,6 +213,11 @@ class ViCoPolicy:
         self.agent_state["nav_guard_coords"] = guard_keys
         if self.team_hub is not None:
             self.team_hub.update_nav_guard(self.agent_id, guard_summary)
+        # Get scene_bounds from agent_memory if available
+        scene_bounds = None
+        if self.agent_memory is not None and hasattr(self.agent_memory, "_scene_bounds"):
+            scene_bounds = getattr(self.agent_memory, "_scene_bounds", None)
+        
         context_extra = {
             "nav_guard_info": guard_summary,
             "guard_cooldown": 0,
@@ -194,6 +228,9 @@ class ViCoPolicy:
             "visible_objects": self.agent_state.get("visible_summary", []),
             "goal_objects": self.agent_state.get("goal_objects_raw", {}),
         }
+        if scene_bounds:
+            context_extra["scene_bounds"] = scene_bounds
+            self.agent_state["scene_bounds"] = scene_bounds
         if self.logger and getattr(self.logger, "debug", None):
             team_count = len(snapshot.team_symbolic) if getattr(snapshot, "team_symbolic", None) else 0
             partner_count = 0
@@ -314,6 +351,41 @@ class ViCoPolicy:
         if plan is None:
             plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "no_plan"})
         plan = self._ensure_plan_target(plan)
+        # Reject plans with targets outside map boundaries and add to skip_targets
+        if plan.target_position is not None and self.agent_memory is not None:
+            target_pos = plan.target_position
+            rejected = False
+            if hasattr(self.agent_memory, "_scene_bounds"):
+                bounds = getattr(self.agent_memory, "_scene_bounds", None)
+                if bounds:
+                    x, y, z = target_pos
+                    x_min = bounds.get("x_min")
+                    x_max = bounds.get("x_max")
+                    z_min = bounds.get("z_min")
+                    z_max = bounds.get("z_max")
+                    if (x_min is not None and x_max is not None and (x < x_min or x > x_max)) or \
+                       (z_min is not None and z_max is not None and (z < z_min or z > z_max)):
+                        if self.logger:
+                            self.logger.warning(
+                                "[Policy] rejecting plan with target outside map bounds: %s (bounds: x=[%s, %s], z=[%s, %s])",
+                                target_pos,
+                                x_min, x_max, z_min, z_max,
+                            )
+                        # Add to skip_targets to prevent LLM from suggesting it again
+                        self._register_skip_target(position=target_pos)
+                        plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "target_outside_map_bounds"})
+                        rejected = True
+            # Also check with check_pos_in_room if available
+            if not rejected and plan.target_position is not None and self.env_api and "check_pos_in_room" in self.env_api:
+                if not self.env_api["check_pos_in_room"]((target_pos[0], target_pos[2])):
+                    if self.logger:
+                        self.logger.warning(
+                            "[Policy] rejecting plan with target outside room: %s (adding to skip_targets)",
+                            target_pos,
+                        )
+                    # Add to skip_targets to prevent LLM from suggesting it again
+                    self._register_skip_target(position=target_pos)
+                    plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "target_outside_room"})
         if plan.action_type != "idle" and guidance.source == "llm":
             self.last_reasoner_frame = frame
             if self.logger:
@@ -395,22 +467,104 @@ class ViCoPolicy:
             }
             position = item.get("position", None)
             location = item.get("location", None)
+            # NOTE: visible_objects from tdw_gym.py only contains id, type, seg_color, name (no position field)
+            # So position will always be None here, and we need to calculate it
+            # Try to get position from multiple sources
             if position is None and location is None:
-                if hasattr(self.agent_memory, "get_object_position"):
+                # First try agent_memory.get_object_position (from stored object_info)
+                if self.agent_memory is not None and hasattr(self.agent_memory, "get_object_position"):
                     try:
-                        position = self.agent_memory.get_object_position(obj_id)
-                        if position is not None:
-                            position = list(position) if isinstance(position, (list, tuple, np.ndarray)) else position
+                        mem_pos = self.agent_memory.get_object_position(obj_id)
+                        if mem_pos is not None:
+                            position = list(mem_pos) if isinstance(mem_pos, (list, tuple, np.ndarray)) else mem_pos
                     except (KeyError, AttributeError, Exception):
                         pass
-                if position is None and hasattr(self.agent_memory, "object_info") and obj_id in getattr(self.agent_memory, "object_info", {}):
+                # Then try agent_memory.object_info
+                if position is None and self.agent_memory is not None and hasattr(self.agent_memory, "object_info"):
                     try:
-                        obj_info = self.agent_memory.object_info[obj_id]
-                        position = obj_info.get("position")
-                        if position is not None:
-                            position = list(position) if isinstance(position, (list, tuple, np.ndarray)) else position
+                        if obj_id in self.agent_memory.object_info:
+                            obj_info = self.agent_memory.object_info[obj_id]
+                            mem_pos = obj_info.get("position")
+                            if mem_pos is not None:
+                                position = list(mem_pos) if isinstance(mem_pos, (list, tuple, np.ndarray)) else mem_pos
                     except (KeyError, AttributeError, Exception):
                         pass
+                # If still None, try to calculate position using cal_object_position (like COELA does)
+                # Note: agent_memory.update() is already called before policy.act(), so agent_memory.obs is up-to-date
+                # CRITICAL: visible_objects from tdw_gym.py does NOT include position, so we MUST calculate it here
+                if position is None:
+                    has_seg_color = "seg_color" in item
+                    has_obs = hasattr(self.agent_memory, "obs") and self.agent_memory.obs is not None
+                    has_cal_method = self.agent_memory is not None and hasattr(self.agent_memory, "cal_object_position")
+                    
+                    # Always log to understand why cal_object_position is not being called
+                    if self.logger:
+                        self.logger.info(
+                            "[Policy] _prepare_perception_inputs: position=None for id=%s name=%s has_seg_color=%s has_obs=%s has_cal_method=%s",
+                            obj_id,
+                            obj_name,
+                            has_seg_color,
+                            has_obs,
+                            has_cal_method,
+                        )
+                    
+                    if has_cal_method and has_seg_color and has_obs:
+                        try:
+                            calc_pos, _ = self.agent_memory.cal_object_position(item)
+                            if calc_pos is not None:
+                                position = list(calc_pos) if isinstance(calc_pos, (list, tuple, np.ndarray)) else calc_pos
+                                if self.logger:
+                                    self.logger.info(
+                                        "[Policy] _prepare_perception_inputs: cal_object_position SUCCEEDED for id=%s name=%s position=%s",
+                                        obj_id,
+                                        obj_name,
+                                        position,
+                                    )
+                                # Also store it in object_info for future use (agent_memory.get_object_list() might have skipped it)
+                                if hasattr(self.agent_memory, "object_info"):
+                                    if obj_id not in self.agent_memory.object_info:
+                                        self.agent_memory.object_info[obj_id] = {}
+                                    self.agent_memory.object_info[obj_id]["position"] = position
+                            else:
+                                # Log only once per object per frame to reduce log spam
+                                if self.logger:
+                                    if not hasattr(self, '_logged_cal_failed_objects'):
+                                        self._logged_cal_failed_objects = set()
+                                    if obj_id not in self._logged_cal_failed_objects:
+                                        self.logger.debug(
+                                            "[Policy] _prepare_perception_inputs: cal_object_position returned None for id=%s name=%s",
+                                            obj_id,
+                                            obj_name,
+                                        )
+                                        self._logged_cal_failed_objects.add(obj_id)
+                        except (KeyError, AttributeError, Exception) as exc:
+                            if self.logger:
+                                self.logger.warning(
+                                    "[Policy] _prepare_perception_inputs: cal_object_position FAILED for id=%s name=%s: %s",
+                                    obj_id,
+                                    obj_name,
+                                    exc,
+                                )
+                    elif self.logger:
+                        self.logger.warning(
+                            "[Policy] _prepare_perception_inputs: cal_object_position SKIPPED for id=%s name=%s (has_seg_color=%s has_obs=%s has_cal_method=%s)",
+                            obj_id,
+                            obj_name,
+                            has_seg_color,
+                            has_obs,
+                            has_cal_method,
+                        )
+                # Also check if position is in the item dict with different keys
+                if position is None:
+                    for key in ["pos", "world_position", "world_pos", "xyz", "coord", "coordinates"]:
+                        if key in item:
+                            try:
+                                pos_val = item[key]
+                                if pos_val is not None:
+                                    position = list(pos_val) if isinstance(pos_val, (list, tuple, np.ndarray)) else pos_val
+                                    break
+                            except Exception:
+                                pass
             if position is None:
                 position = location
             obj_pos: Optional[np.ndarray] = None
@@ -691,21 +845,51 @@ class ViCoPolicy:
             str(name).lower()
             for name in self.agent_state.get("skip_targets", {}).get("names", set())
         }
+        # Get holding_ids to exclude already held objects
+        holding_ids = set(self.agent_state.get("holding_ids", []))
         candidates: List[Tuple[float, Dict[str, Any]]] = []
         filtered_reasons: Dict[str, int] = {}
         for info in object_infos:
             if not info.get("is_grabbable"):
                 filtered_reasons["not_grabbable"] = filtered_reasons.get("not_grabbable", 0) + 1
                 continue
-            if info.get("id") is None:
+            obj_id = info.get("id")
+            if obj_id is None:
                 filtered_reasons["no_id"] = filtered_reasons.get("no_id", 0) + 1
+                continue
+            # Skip objects that are already being held
+            if obj_id in holding_ids:
+                filtered_reasons["already_held"] = filtered_reasons.get("already_held", 0) + 1
                 continue
             position = self._normalise_position(info.get("position"))
             if position is None:
                 position = self._normalise_position(info.get("location"))
-                if position is None:
-                    filtered_reasons["no_position"] = filtered_reasons.get("no_position", 0) + 1
-                    continue
+            if position is None:
+                # Try to get position from agent_memory
+                obj_id = info.get("id")
+                if obj_id is not None and self.agent_memory is not None:
+                    if hasattr(self.agent_memory, "get_object_position"):
+                        try:
+                            mem_pos = self.agent_memory.get_object_position(obj_id)
+                            if mem_pos is not None:
+                                position = self._normalise_position(mem_pos)
+                                # Update info with found position
+                                if position is not None:
+                                    info["position"] = position
+                        except Exception:
+                            pass
+                    if position is None and hasattr(self.agent_memory, "object_info") and obj_id in getattr(self.agent_memory, "object_info", {}):
+                        try:
+                            obj_info = self.agent_memory.object_info[obj_id]
+                            mem_pos = obj_info.get("position")
+                            if mem_pos is not None:
+                                position = self._normalise_position(mem_pos)
+                                # Update info with found position
+                                if position is not None:
+                                    info["position"] = position
+                        except Exception:
+                            pass
+            # Calculate distance if missing
             if info.get("distance") is None:
                 if position is not None and agent_pos is not None:
                     try:
@@ -715,11 +899,19 @@ class ViCoPolicy:
                         else:
                             info["distance"] = float(np.linalg.norm(agent_pos - pos_arr))
                     except Exception:
-                        filtered_reasons["no_distance"] = filtered_reasons.get("no_distance", 0) + 1
-                        continue
+                        pass
+            # For task targets, be more lenient - allow pick even without position if we have distance
+            if position is None:
+                # If it's a task target and we have distance, we can still try to pick (will use object_id only)
+                if info.get("is_task_target") and info.get("distance") is not None:
+                    # Allow it, but we'll need to handle this in executor
+                    pass
                 else:
-                    filtered_reasons["no_distance"] = filtered_reasons.get("no_distance", 0) + 1
+                    filtered_reasons["no_position"] = filtered_reasons.get("no_position", 0) + 1
                     continue
+            if info.get("distance") is None:
+                filtered_reasons["no_distance"] = filtered_reasons.get("no_distance", 0) + 1
+                continue
             distance = float(info["distance"])
             max_distance = 4.5 if info.get("is_task_target") else 3.0
             if not np.isfinite(distance) or distance > max_distance:
@@ -748,8 +940,91 @@ class ViCoPolicy:
         best_info = candidates[0][1]
         target_id = best_info.get("id")
         target_pos = self._normalise_position(best_info.get("position"))
-        if target_id is None or target_pos is None:
+        if target_id is None:
             return None
+        # If position is None but we have distance, try to estimate position or allow pick without position
+        if target_pos is None:
+            distance = best_info.get("distance")
+            is_task_target = best_info.get("is_task_target", False)
+            if distance is not None and agent_pos is not None:
+                # Try to estimate position first (preferred for task targets)
+                if is_task_target:
+                    try:
+                        # Get forward vector from agent_memory
+                        agent_forward = None
+                        if self.agent_memory is not None and hasattr(self.agent_memory, "forward"):
+                            agent_forward = self.agent_memory.forward
+                        if agent_forward is not None:
+                            forward_arr = np.asarray(agent_forward, dtype=np.float32)
+                            if len(forward_arr) >= 3:
+                                # Normalize forward vector
+                                forward_norm = np.linalg.norm(forward_arr)
+                                if forward_norm > 1e-6:
+                                    forward_arr = forward_arr / forward_norm
+                                    # Estimate target position in XZ plane (use X and Z components)
+                                    estimated_x = float(agent_pos[0]) + float(distance) * forward_arr[0]
+                                    estimated_z = float(agent_pos[2]) + float(distance) * forward_arr[2]
+                                    estimated_y = float(agent_pos[1])  # Keep same height
+                                    target_pos = (estimated_x, estimated_y, estimated_z)
+                                    if self.logger:
+                                        self.logger.info(
+                                            "[Policy] _maybe_force_pick: estimated position for task target id=%s name=%s dist=%.2f pos=%s",
+                                            target_id,
+                                            best_info.get("name"),
+                                            distance,
+                                            target_pos,
+                                        )
+                    except Exception as exc:
+                        if self.logger:
+                            self.logger.debug(
+                                "[Policy] _maybe_force_pick: position estimation failed: id=%s name=%s error=%s",
+                                target_id,
+                                best_info.get("name"),
+                                exc,
+                            )
+                
+                # If position is still None but distance is close enough, allow pick without position
+                # Executor will handle this case
+                if target_pos is None:
+                    if distance <= 2.5:  # Allow pick if distance is close enough
+                        if self.logger:
+                            self.logger.info(
+                                "[Policy] _maybe_force_pick: allowing pick without position (id=%s name=%s dist=%.2f)",
+                                target_id,
+                                best_info.get("name"),
+                                distance,
+                            )
+                        # Keep target_pos as None, executor will handle it
+                    else:
+                        if self.logger:
+                            self.logger.debug(
+                                "[Policy] _maybe_force_pick: skipping without position (too far): id=%s name=%s distance=%.2f",
+                                target_id,
+                                best_info.get("name"),
+                                distance,
+                            )
+                        return None
+            else:
+                if self.logger:
+                    self.logger.debug(
+                        "[Policy] _maybe_force_pick: skipping without position: id=%s name=%s is_task_target=%s distance=%s",
+                        target_id,
+                        best_info.get("name"),
+                        is_task_target,
+                        distance,
+                    )
+                return None
+        # Reject invalid positions (0,0,0 is likely a default/placeholder)
+        # But allow None if distance is close enough (handled above)
+        if target_pos is not None:
+            if target_pos == (0.0, 0.0, 0.0) or (abs(target_pos[0]) < 0.01 and abs(target_pos[2]) < 0.01):
+                if self.logger:
+                    self.logger.debug(
+                        "[Policy] _maybe_force_pick: skipping invalid position (0,0,0): id=%s name=%s",
+                        target_id,
+                        best_info.get("name"),
+                    )
+                return None
         meta = {
             "reason": "policy_override_grabbable",
             "target_name": best_info.get("name"),
@@ -797,6 +1072,24 @@ class ViCoPolicy:
             position = self._normalise_position(info.get("position"))
             if position is None:
                 position = self._normalise_position(info.get("location"))
+            if position is None:
+                # Try to get position from agent_memory
+                if container_id is not None and self.agent_memory is not None:
+                    if hasattr(self.agent_memory, "get_object_position"):
+                        try:
+                            mem_pos = self.agent_memory.get_object_position(container_id)
+                            if mem_pos is not None:
+                                position = self._normalise_position(mem_pos)
+                        except Exception:
+                            pass
+                    if position is None and hasattr(self.agent_memory, "object_info") and container_id in getattr(self.agent_memory, "object_info", {}):
+                        try:
+                            obj_info = self.agent_memory.object_info[container_id]
+                            mem_pos = obj_info.get("position")
+                            if mem_pos is not None:
+                                position = self._normalise_position(mem_pos)
+                        except Exception:
+                            pass
             if position is None:
                 filtered_reasons["no_position"] = filtered_reasons.get("no_position", 0) + 1
                 continue

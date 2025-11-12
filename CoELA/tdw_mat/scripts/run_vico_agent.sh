@@ -39,6 +39,7 @@ export VICO_REASONER_MODEL=$MODEL
   --communication \
   --eval_episodes "$EPISODES" \
   --port "$PORT" \
+  --screen_size 256 \
   --no_save_img \
   --debug \
   "$@"

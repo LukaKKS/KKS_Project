@@ -67,7 +67,11 @@ class PolicyReasoner:
             LOGGER.warning("PolicyReasoner running in heuristic-only mode (missing OpenAI client).")
             return None
         try:
-            client = OpenAI(api_key=api_key)
+            import httpx
+            client = OpenAI(
+                api_key=api_key,
+                timeout=httpx.Timeout(30.0, connect=10.0),  # 30초 타임아웃, 연결 10초
+            )
             return client
         except Exception as exc:  # pragma: no cover
             LOGGER.warning("Failed to initialise OpenAI client (%s). Falling back to heuristics.", exc)
@@ -159,6 +163,7 @@ class PolicyReasoner:
             "coords_str": skip_text.get("coords", []),
             "names_str": ", ".join(name_strings) if name_strings else "",
         }
+        scene_bounds = context.get("scene_bounds")
         payload = {
             "frame": context.get("frame"),
             "role": context.get("role"),
@@ -178,6 +183,8 @@ class PolicyReasoner:
             "visible_objects": context.get("visible_objects", []),
             "goal_objects": context.get("goal_objects", {}),
         }
+        if scene_bounds:
+            payload["scene_bounds"] = scene_bounds
         return [
             {"role": "system", "content": self._prompt_template},
             {
@@ -227,7 +234,12 @@ class PolicyReasoner:
                 self._warning_logged["raw_response"] = True
             return content
         except Exception as exc:  # pragma: no cover
-            LOGGER.warning("PolicyReasoner chat completion failed (%s)", exc)
+            frame = (context or {}).get("frame", "?")
+            exc_type = type(exc).__name__
+            if "timeout" in str(exc).lower() or "timed out" in str(exc).lower():
+                LOGGER.warning("PolicyReasoner chat completion timeout (frame=%s, exc=%s)", frame, exc_type)
+            else:
+                LOGGER.warning("PolicyReasoner chat completion failed (frame=%s, exc=%s: %s)", frame, exc_type, str(exc)[:200])
             return None
 
     # Reflection ----------------------------------------------------------------
@@ -339,10 +351,35 @@ class PolicyReasoner:
                 continue
             if target_tuple is not None:
                 coord_key = (round(float(target_tuple[0]), 2), round(float(target_tuple[2]), 2))
+                # First check skip_coords (most strict)
                 if coord_key in skip_coords:
+                    if LOGGER and not self._warning_logged.get("skip_coord_filtered"):
+                        LOGGER.debug("PolicyReasoner filtering candidate: coord %s in skip_coords", coord_key)
+                        self._warning_logged["skip_coord_filtered"] = True
                     continue
                 if _is_blocked(float(target_tuple[0]), float(target_tuple[2])):
                     continue
+                # Check scene_bounds if available (with safety margin)
+                scene_bounds = context.get("scene_bounds")
+                if scene_bounds:
+                    x, y, z = target_tuple
+                    x_min = scene_bounds.get("x_min")
+                    x_max = scene_bounds.get("x_max")
+                    z_min = scene_bounds.get("z_min")
+                    z_max = scene_bounds.get("z_max")
+                    # Add safety margin to prevent going near boundaries (increased to 1.0m for better safety)
+                    margin = 1.0
+                    if (x_min is not None and x_max is not None and (x < x_min + margin or x > x_max - margin)) or \
+                       (z_min is not None and z_max is not None and (z < z_min + margin or z > z_max - margin)):
+                        # Filter out candidates outside or too close to scene bounds
+                        if LOGGER and not self._warning_logged.get("scene_bounds_filtered"):
+                            LOGGER.debug(
+                                "PolicyReasoner filtering candidate: %s outside scene_bounds (x=[%s, %s], z=[%s, %s])",
+                                target_tuple,
+                                x_min, x_max, z_min, z_max,
+                            )
+                            self._warning_logged["scene_bounds_filtered"] = True
+                        continue
             name_lc = str(target_name).lower() if isinstance(target_name, str) else ""
             is_task_target = name_lc in task_targets
             is_task_container = name_lc in task_containers

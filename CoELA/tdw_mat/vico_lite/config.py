@@ -72,7 +72,7 @@ class ViCoConfig:
     reasoner_model: str = "gpt-4o-mini"
     reasoner_temperature: float = 0.2
     reasoner_candidate_topk: int = 3
-    reasoner_reflection: bool = True
+    reasoner_reflection: bool = False  # 비활성화: LLM 호출 지연 방지
     reasoner_min_interval: int = 30
     reasoner_cache_ttl: int = 120
     reasoner_plan_horizon: int = 15
