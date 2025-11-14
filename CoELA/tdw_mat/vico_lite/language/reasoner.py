@@ -123,15 +123,18 @@ class PolicyReasoner:
         if response is None:
             return []
         last_exc: Optional[Exception] = None
+        candidates: List[Dict[str, Any]] = []
         for block in self._iter_json_blocks(response):
             try:
                 payload = json.loads(block)
                 if isinstance(payload, list):
-                    return payload[: self.cfg.reasoner_candidate_topk]
+                    candidates = payload[: self.cfg.reasoner_candidate_topk]
+                    break
                 if isinstance(payload, dict) and "candidates" in payload:
                     items = payload.get("candidates", [])
                     if isinstance(items, list):
-                        return items[: self.cfg.reasoner_candidate_topk]
+                        candidates = items[: self.cfg.reasoner_candidate_topk]
+                        break
             except Exception as exc:  # pragma: no cover
                 last_exc = exc
         if last_exc is not None:
@@ -141,7 +144,49 @@ class PolicyReasoner:
                 last_exc,
                 response[:200],
             )
-        return []
+        # Early validation: filter out candidates with invalid target_pos before _select_plan
+        scene_bounds = context.get("scene_bounds")
+        if scene_bounds and candidates:
+            margin = 1.0
+            x_min = scene_bounds.get("x_min")
+            x_max = scene_bounds.get("x_max")
+            z_min = scene_bounds.get("z_min")
+            z_max = scene_bounds.get("z_max")
+            validated: List[Dict[str, Any]] = []
+            for candidate in candidates:
+                target_pos = candidate.get("target_pos") or candidate.get("target_position")
+                if target_pos and isinstance(target_pos, (list, tuple)) and len(target_pos) >= 3:
+                    x, y, z = float(target_pos[0]), float(target_pos[1]), float(target_pos[2])
+                    # Check if within bounds with margin
+                    if (x_min is None or x_max is None or (x_min + margin <= x <= x_max - margin)) and \
+                       (z_min is None or z_max is None or (z_min + margin <= z <= z_max - margin)):
+                        validated.append(candidate)
+                    elif LOGGER and not self._warning_logged.get("early_filtered"):
+                        LOGGER.debug(
+                            "PolicyReasoner early filtering: candidate %s outside scene_bounds (x=[%s, %s], z=[%s, %s])",
+                            target_pos,
+                            x_min, x_max, z_min, z_max,
+                        )
+                        self._warning_logged["early_filtered"] = True
+                else:
+                    validated.append(candidate)  # Keep candidates without target_pos
+            candidates = validated
+        return candidates
+
+    def _convert_to_json_serializable(self, obj: Any) -> Any:
+        """Convert numpy types and other non-JSON-serializable types to Python native types."""
+        if isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif isinstance(obj, dict):
+            return {k: self._convert_to_json_serializable(v) for k, v in obj.items()}
+        elif isinstance(obj, (list, tuple)):
+            return [self._convert_to_json_serializable(item) for item in obj]
+        else:
+            return obj
 
     def _build_prompt(self, context: Dict[str, Any]) -> List[Dict[str, str]]:
         description = context.get("memory_symbolic", [])
@@ -185,6 +230,8 @@ class PolicyReasoner:
         }
         if scene_bounds:
             payload["scene_bounds"] = scene_bounds
+        # Convert numpy types to JSON-serializable types
+        payload = self._convert_to_json_serializable(payload)
         return [
             {"role": "system", "content": self._prompt_template},
             {
@@ -256,14 +303,14 @@ class PolicyReasoner:
             {
                 "role": "user",
                 "content": json.dumps(
-                    {
+                    self._convert_to_json_serializable({
                         "plan": plan.meta,
                         "context": {
                             "role": context.get("role"),
                             "subgoal": context.get("subgoal"),
                             "holding": context.get("holding_ids"),
                         },
-                    },
+                    }),
                     ensure_ascii=False,
                 ),
             },

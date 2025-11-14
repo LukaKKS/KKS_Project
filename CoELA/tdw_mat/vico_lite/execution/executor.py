@@ -40,7 +40,11 @@ class PlanExecutor:
         action_type = plan.action_type
         meta: Dict[str, Any] = {"plan": plan.meta}
         command: Dict[str, Any]
-        if action_type in {"move", "search", "assist", "deliver"}:
+        if action_type == "deliver":
+            # Deliver: navigate to target, then put_in
+            command, nav_meta = self._navigate_and_deliver(plan, agent_state)
+            meta.update(nav_meta)
+        elif action_type in {"move", "search", "assist"}:
             command, nav_meta = self._navigate_to(plan.target_position, agent_state, follow=False)
             meta.update(nav_meta)
         elif action_type == "pick":
@@ -58,6 +62,67 @@ class PlanExecutor:
                 command,
                 meta,
             )
+        return command, meta
+
+    # ---------------------------------------------------------------------
+    def _navigate_and_deliver(self, plan, agent_state):
+        """Navigate to target container and execute put_in action."""
+        target_pos = plan.target_position
+        target_id = plan.target_id
+        meta = {"navigation": "deliver"}
+        
+        if target_pos is None:
+            if self.logger:
+                self.logger.warning("[Executor] deliver: target_pos is None")
+            meta.update({"reason": "no_target_position"})
+            return {"type": "ongoing"}, meta
+        
+        # Navigate to target first
+        command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True)
+        meta.update(nav_meta)
+        
+        # Calculate actual distance from agent to target AFTER navigation (not path_len)
+        actual_distance = float("inf")
+        if self.agent_memory is not None and hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
+            try:
+                agent_pos = self.agent_memory.position
+                if isinstance(agent_pos, (list, tuple, np.ndarray)) and len(agent_pos) >= 3:
+                    agent_arr = np.array([agent_pos[0], agent_pos[2]])
+                    target_arr = np.array([target_pos[0], target_pos[2] if len(target_pos) > 2 else target_pos[1]])
+                    actual_distance = float(np.linalg.norm(agent_arr - target_arr))
+            except Exception as exc:
+                if self.logger:
+                    self.logger.debug("[Executor] deliver: failed to calculate actual distance: %s", exc)
+        
+        # Also check distance from plan.meta if available (this is the distance calculated in policy)
+        plan_distance = plan.meta.get("distance")
+        if plan_distance is not None and isinstance(plan_distance, (int, float)):
+            # Use the smaller of actual_distance and plan_distance
+            if actual_distance == float("inf") or plan_distance < actual_distance:
+                actual_distance = plan_distance
+        
+        # If we're close enough (actual distance, not path_len), execute put_in
+        if actual_distance is not None and actual_distance <= 3.0:  # Increased threshold to 3.0m
+            # Close enough to put_in
+            if self.logger:
+                self.logger.info(
+                    "[Executor] deliver: close enough (actual_dist=%.2f), executing put_in",
+                    actual_distance,
+                )
+            # Execute put_in action (type 4)
+            command = {"type": 4}
+            meta.update({"result": "put_in", "distance": actual_distance, "actual_distance": actual_distance})
+        elif nav_meta.get("forced_failure"):
+            # Navigation failed, but still try put_in if we have target_id and we're reasonably close
+            if target_id is not None and actual_distance <= 5.0:
+                if self.logger:
+                    self.logger.info(
+                        "[Executor] deliver: navigation failed but close enough (dist=%.2f), attempting put_in",
+                        actual_distance,
+                    )
+                command = {"type": 4}
+                meta.update({"result": "put_in_after_nav_failure", "distance": actual_distance})
+        
         return command, meta
 
     # ---------------------------------------------------------------------
@@ -203,15 +268,36 @@ class PlanExecutor:
             meta.update({"reason": "missing_target_id"})
             return {"type": "ongoing"}, meta
         
+        # Convert to int and check if it's valid (0 is not a valid object_id)
+        try:
+            target_id_int = int(target_id)
+            if target_id_int == 0:
+                if self.logger:
+                    self.logger.warning(
+                        "[Executor] target_id=%s is 0 (invalid), skipping pick (may cause KeyError)",
+                        target_id,
+                    )
+                meta.update({"reason": "invalid_target_id_zero"})
+                return {"type": "ongoing"}, meta
+        except (ValueError, TypeError) as exc:
+            if self.logger:
+                self.logger.warning(
+                    "[Executor] target_id=%s cannot be converted to int: %s",
+                    target_id,
+                    exc,
+                )
+            meta.update({"reason": "invalid_target_id_type"})
+            return {"type": "ongoing"}, meta
+        
         # Check if object_id exists in agent_memory.object_info (to prevent KeyError in tdw_gym)
         # This is a best-effort check since we can't directly access object_manager.transforms
         if self.agent_memory is not None and hasattr(self.agent_memory, "object_info"):
             try:
-                if int(target_id) not in self.agent_memory.object_info:
+                if target_id_int not in self.agent_memory.object_info:
                     if self.logger:
                         self.logger.warning(
                             "[Executor] object_id=%s not in agent_memory.object_info, skipping pick (may cause KeyError)",
-                            target_id,
+                            target_id_int,
                         )
                     meta.update({"reason": "object_not_in_memory"})
                     return {"type": "ongoing"}, meta
@@ -219,7 +305,7 @@ class PlanExecutor:
                 if self.logger:
                     self.logger.debug(
                         "[Executor] failed to check agent_memory.object_info for id=%s: %s",
-                        target_id,
+                        target_id_int,
                         exc,
                     )
         
@@ -230,7 +316,7 @@ class PlanExecutor:
             meta.update({"reason": "hands_full"})
             return {"type": "ongoing"}, meta
         arm = "right" if left_busy and not right_busy else "left"
-        command = {"type": 3, "object": target_id, "arm": arm}
+        command = {"type": 3, "object": target_id_int, "arm": arm}
         meta.update({"result": "attempt_pick", "arm": arm})
         if self.logger and getattr(self.logger, "debug", None):
             self.logger.debug("[Executor] issuing pick command=%s meta=%s", command, meta)

@@ -341,6 +341,9 @@ class TDW(Env):
             'get_room_distance': self.get_room_distance,
             'get_id_from_mask': partial(self.get_id_from_mask, agent_id=i),
             'get_with_character_mask': partial(self.get_with_character_mask, agent_id=i),
+            'goal_position_id': self.goal_position_id,  # Add goal_position_id to env_api
+            'container_ids': self.container_ids,  # Add container_ids for reference
+            'get_goal_position': self._get_goal_position,  # Add function to get actual goal_position location
         } for i in range(self.number_of_agents)]
         self.obs = self.get_obs()
         return self.obs_filter(self.obs), info, env_api
@@ -415,15 +418,45 @@ class TDW(Env):
 
     def get_2d_distance(self, pos1, pos2):
         return np.linalg.norm(np.array(pos1[[0, 2]]) - np.array(pos2[[0, 2]]))
+    
+    def _get_goal_position(self):
+        """Get the actual position of goal_position_id from object_manager"""
+        if self.goal_position_id is None:
+            return None
+        if self.goal_position_id not in self.object_manager.transforms:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.warning(
+                    "[TDW] _get_goal_position: goal_position_id=%d not in object_manager.transforms",
+                    self.goal_position_id,
+                )
+            return None
+        return list(self.object_manager.transforms[self.goal_position_id].position)
 
     def check_goal(self):
         r'''
         Check if the goal is achieved
         return: count, total, done
         '''
+        # Check if goal_position_id exists in object_manager.transforms
+        if self.goal_position_id not in self.object_manager.transforms:
+            if hasattr(self, 'logger') and self.logger:
+                self.logger.warning(
+                    "[TDW] check_goal: goal_position_id=%d not in object_manager.transforms",
+                    self.goal_position_id,
+                )
+            return 0, len(self.target_object_ids), False
+        
         place_pos = self.object_manager.transforms[self.goal_position_id].position
         count = 0
         for object_id in self.target_object_ids:
+            # Check if object_id exists in object_manager.transforms to prevent KeyError
+            if object_id not in self.object_manager.transforms:
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.debug(
+                        "[TDW] check_goal: object_id=%d not in object_manager.transforms, skipping",
+                        object_id,
+                    )
+                continue
             pos = self.object_manager.transforms[object_id].position
             if (self.get_2d_distance(pos, place_pos) < 3 and self.belongs_to_which_room(pos) is not None and 'Bedroom' in self.belongs_to_which_room(pos)) or object_id in self.satisfied.keys():
                 count += 1
@@ -664,16 +697,40 @@ class TDW(Env):
                     elif curr_action['type'] == 'turn_right':     # turn right by 15 degree
                         self.controller.replicants[replicant_id].turn_by(angle = 15)
                     elif curr_action['type'] == 'reach_for':     # go to and grasp object with arm
-                        distance = self.get_2d_distance(self.controller.replicants[replicant_id].dynamic.transform.position, self.object_manager.transforms[int(curr_action["object"])].position)
-                        if distance > self.reach_threshold:
+                        obj_id = int(curr_action["object"])
+                        # Check if object_id exists in object_manager.transforms to prevent KeyError
+                        if obj_id not in self.object_manager.transforms:
+                            if hasattr(self, 'logger') and self.logger:
+                                self.logger.warning(
+                                    "[TDW] reach_for: object_id=%d not in object_manager.transforms, skipping (may cause KeyError)",
+                                    obj_id,
+                                )
                             valid[replicant_id] = False
-                            self.action_buffer[replicant_id] = [] # the action is invaild
-                        else: self.controller.replicants[replicant_id].move_to_position(self.object_manager.transforms[int(curr_action["object"])].position)
+                            self.action_buffer[replicant_id] = [] # the action is invalid
+                        else:
+                            distance = self.get_2d_distance(self.controller.replicants[replicant_id].dynamic.transform.position, self.object_manager.transforms[obj_id].position)
+                            if distance > self.reach_threshold:
+                                valid[replicant_id] = False
+                                self.action_buffer[replicant_id] = [] # the action is invaild
+                            else: 
+                                self.controller.replicants[replicant_id].move_to_position(self.object_manager.transforms[obj_id].position)
                     elif curr_action['type'] == 'grasp':
-                        self.controller.replicants[replicant_id].grasp(int(curr_action["object"]), curr_action["arm"], relative_to_hand = False, axis = "yaw")
+                        obj_id = int(curr_action["object"])
+                        # Check if object_id exists in object_manager.transforms to prevent KeyError
+                        if obj_id not in self.object_manager.transforms:
+                            if hasattr(self, 'logger') and self.logger:
+                                self.logger.warning(
+                                    "[TDW] grasp: object_id=%d not in object_manager.transforms, skipping (may cause KeyError)",
+                                    obj_id,
+                                )
+                            valid[replicant_id] = False
+                            self.action_buffer[replicant_id] = [] # the action is invalid
+                        else:
+                            self.controller.replicants[replicant_id].grasp(obj_id, curr_action["arm"], relative_to_hand = False, axis = "yaw")
                     elif curr_action["type"] == 'put_in':      # put in container
                         self.controller.replicants[replicant_id].put_in()
                         held_objects = list(self.controller.state.replicants[replicant_id].values())
+                        # Check if we have objects in both hands (standard put_in case)
                         if held_objects[0] is not None and held_objects[1] is not None:
                             container, target = None, None
                             if self.get_object_type(held_objects[0]) == 1:
@@ -690,6 +747,44 @@ class TDW(Env):
                                         self.containment_all[container].append(target)
                                 else:
                                     self.containment_all[container] = [target]
+                        # Handle case where agent holds only one object and target is goal_position_id (type 2)
+                        elif (held_objects[0] is not None or held_objects[1] is not None) and self.goal_position_id is not None:
+                            # Get the held object
+                            held_obj = held_objects[0] if held_objects[0] is not None else held_objects[1]
+                            if held_obj is not None and held_obj in self.target_object_ids:
+                                # Check if goal_position_id exists in object_manager.transforms
+                                if self.goal_position_id not in self.object_manager.transforms:
+                                    if self.logger:
+                                        self.logger.warning(
+                                            "[TDW] put_in: goal_position_id=%d not in object_manager.transforms, skipping",
+                                            self.goal_position_id,
+                                        )
+                                else:
+                                    # Check if agent is near goal_position_id (within 3m)
+                                    agent_pos = self.controller.replicants[replicant_id].dynamic.transform.position
+                                    goal_pos = self.object_manager.transforms[self.goal_position_id].position
+                                    distance = self.get_2d_distance(agent_pos, goal_pos)
+                                    if distance < 3.0:
+                                        # Successfully delivered to goal position
+                                        # Mark as satisfied in check_goal
+                                        if not hasattr(self, 'satisfied'):
+                                            self.satisfied = {}
+                                        self.satisfied[held_obj] = True
+                                        if self.logger:
+                                            self.logger.info(
+                                                "[TDW] put_in success: object_id=%d delivered to goal_position_id=%d (dist=%.2f)",
+                                                held_obj,
+                                                self.goal_position_id,
+                                                distance,
+                                            )
+                                    else:
+                                        if self.logger:
+                                            self.logger.debug(
+                                                "[TDW] put_in: object_id=%d too far from goal_position_id=%d (dist=%.2f > 3.0)",
+                                                held_obj,
+                                                self.goal_position_id,
+                                                distance,
+                                            )
                     elif curr_action["type"] == 'drop':      # drop held object in arm
                         self.controller.replicants[replicant_id].drop(curr_action['arm'], max_num_frames = 30)
                     elif curr_action["type"] == 'send_message':      # send message
@@ -708,6 +803,19 @@ class TDW(Env):
         self.num_frames += num_frames
         self.action_list.append(actions)
         goal_put, goal_total, self.success = self.check_goal()
+        # Log check_goal result for debugging (only log when count changes or every 10 steps)
+        if hasattr(self, 'logger') and self.logger:
+            if not hasattr(self, '_last_goal_count'):
+                self._last_goal_count = -1
+            if goal_put != self._last_goal_count or self.num_step % 10 == 0:
+                self.logger.info(
+                    "[TDW] check_goal: count=%d/%d, done=%s (step=%d)",
+                    goal_put,
+                    goal_total,
+                    self.success,
+                    self.num_step,
+                )
+                self._last_goal_count = goal_put
         reward = 0
         for replicant_id in self.controller.replicants:
             action = actions[str(replicant_id)]

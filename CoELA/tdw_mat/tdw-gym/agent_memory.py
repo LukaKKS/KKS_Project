@@ -168,6 +168,7 @@ class AgentMemory():
         # Reset logged colors and failed objects cache for this frame
         self._logged_colors = set()
         self._logged_failed_objects = set()
+        self._logged_depth_extensions = set()
         self.ignore_logic(self.obs['current_frames'], ignore_ids, ignore_obstacles)
         self.local_step += 1
         self.get_object_list()
@@ -268,9 +269,35 @@ class AgentMemory():
         xx = (xx - cx) / fx * depth
         yy = (yy - cy) / fy * depth
 
-        # Relax depth constraint: allow objects up to 20m away (was 10m)
+        # First, check depth range for matched pixels to determine appropriate threshold
+        max_depth = 20.0  # Default max depth
+        if seg_mask.ndim == 3:
+            color_match = np.all(seg_mask == color, axis=-1)
+            matched_depth = depth[color_match]
+            # Filter out invalid depths (0, negative, or 1e9)
+            valid_matched_depth = matched_depth[(matched_depth > 0) & (matched_depth < 1e8)]
+            if len(valid_matched_depth) > 0:
+                # If matched pixels have depth > 20m, extend the range
+                max_matched_depth = valid_matched_depth.max()
+                if max_matched_depth > 20.0:
+                    # Extend to 1.5x the max depth, but cap at 100m for safety
+                    max_depth = min(max_matched_depth * 1.5, 100.0)
+                    if hasattr(self, 'logger') and self.logger:
+                        color_key = tuple(color) if isinstance(color, np.ndarray) else color
+                        if not hasattr(self, '_logged_depth_extensions'):
+                            self._logged_depth_extensions = set()
+                        if color_key not in self._logged_depth_extensions:
+                            self.logger.debug(
+                                "[AgentMemory] get_pc: extending depth range to %.2fm for color=%s (max_matched=%.2f)",
+                                max_depth,
+                                color,
+                                max_matched_depth,
+                            )
+                            self._logged_depth_extensions.add(color_key)
+
+        # Relax depth constraint: allow objects up to max_depth (default 20m, can extend up to 100m)
         # This helps with objects that are further but still visible
-        index = np.where((depth > 0) & (depth < 20))
+        index = np.where((depth > 0) & (depth < max_depth))
         valid_count = len(index[0])
         
         # Log detailed info if too few points (only for debugging, reduce log spam)
@@ -291,14 +318,24 @@ class AgentMemory():
                 if matched_pixels > 0 and hasattr(self, '_logged_colors'):
                     color_key = tuple(color) if isinstance(color, np.ndarray) else color
                     if color_key not in self._logged_colors:
-                        depth_valid = depth[(depth > 0) & (depth < 10)]
+                        # Check depth values for matched pixels specifically
+                        if seg_mask.ndim == 3:
+                            color_match = np.all(seg_mask == color, axis=-1)
+                            matched_depth = depth[color_match]
+                            depth_valid = matched_depth[(matched_depth > 0) & (matched_depth < max_depth)]
+                        else:
+                            matched_depth = depth
+                            depth_valid = depth[(depth > 0) & (depth < max_depth)]
                         self.logger.debug(
-                            "[AgentMemory] get_pc: too few valid points color=%s valid_count=%d matched_pixels=%d depth_range=[%.2f, %.2f]",
+                            "[AgentMemory] get_pc: too few valid points color=%s valid_count=%d matched_pixels=%d depth_range=[%.2f, %.2f] matched_depth_range=[%.2f, %.2f] max_depth=%.2f",
                             color,
                             valid_count,
                             matched_pixels,
                             depth_valid.min() if len(depth_valid) > 0 else -1,
                             depth_valid.max() if len(depth_valid) > 0 else -1,
+                            matched_depth.min() if len(matched_depth) > 0 else -1,
+                            matched_depth.max() if len(matched_depth) > 0 else -1,
+                            max_depth,
                         )
                         self._logged_colors.add(color_key)
                 elif matched_pixels > 0:
@@ -306,14 +343,24 @@ class AgentMemory():
                     if not hasattr(self, '_logged_colors'):
                         self._logged_colors = set()
                     color_key = tuple(color) if isinstance(color, np.ndarray) else color
-                    depth_valid = depth[(depth > 0) & (depth < 10)]
+                    # Check depth values for matched pixels specifically
+                    if seg_mask.ndim == 3:
+                        color_match = np.all(seg_mask == color, axis=-1)
+                        matched_depth = depth[color_match]
+                        depth_valid = matched_depth[(matched_depth > 0) & (matched_depth < max_depth)]
+                    else:
+                        matched_depth = depth
+                        depth_valid = depth[(depth > 0) & (depth < max_depth)]
                     self.logger.debug(
-                        "[AgentMemory] get_pc: too few valid points color=%s valid_count=%d matched_pixels=%d depth_range=[%.2f, %.2f]",
+                        "[AgentMemory] get_pc: too few valid points color=%s valid_count=%d matched_pixels=%d depth_range=[%.2f, %.2f] matched_depth_range=[%.2f, %.2f] max_depth=%.2f",
                         color,
                         valid_count,
                         matched_pixels,
                         depth_valid.min() if len(depth_valid) > 0 else -1,
                         depth_valid.max() if len(depth_valid) > 0 else -1,
+                        matched_depth.min() if len(matched_depth) > 0 else -1,
+                        matched_depth.max() if len(matched_depth) > 0 else -1,
+                        max_depth,
                     )
                     self._logged_colors.add(color_key)
         
@@ -342,9 +389,10 @@ class AgentMemory():
         try:
             seg_color = o_dict['seg_color']
             pc = self.get_pc(seg_color)
-            # Relax minimum point requirement: allow 3 points instead of 5
-            # This helps with small objects or objects with partial visibility
-            if pc is None or pc.shape[1] < 3:
+            # Allow position calculation with as few as 1 point
+            # This is crucial for small objects or objects with partial visibility
+            # Even 1-2 points can provide a useful position estimate
+            if pc is None or pc.shape[1] < 1:
                 # Log why it failed (only once per object per frame to reduce log spam)
                 obj_id = o_dict.get('id')
                 if hasattr(self, 'logger') and self.logger:
@@ -377,6 +425,18 @@ class AgentMemory():
         self.oppo_this_step = False
         self.third_agent_this_step = False
         self.visible_objects = self.obs['visible_objects']
+        # Get goal_position_id from env_api if available
+        goal_position_id = None
+        get_goal_position_func = None
+        if self.env_api is not None:
+            if isinstance(self.env_api, dict):
+                goal_position_id = self.env_api.get('goal_position_id')
+                get_goal_position_func = self.env_api.get('get_goal_position')
+            elif hasattr(self.env_api, 'goal_position_id'):
+                goal_position_id = self.env_api.goal_position_id
+                if hasattr(self.env_api, 'get_goal_position'):
+                    get_goal_position_func = self.env_api.get_goal_position
+        
         for o_dict in self.visible_objects:
             if o_dict['id'] is None:
                 continue
@@ -384,7 +444,57 @@ class AgentMemory():
             if o_dict['id'] in self.ignore_ids:
                 continue
             object_id = o_dict['id']
-            position, pc = self.cal_object_position(o_dict)
+            
+            # For goal_position_id, try to get actual position from object_manager first
+            position = None
+            if goal_position_id is not None and object_id == goal_position_id and get_goal_position_func is not None:
+                try:
+                    actual_pos = get_goal_position_func()
+                    if actual_pos is not None:
+                        position = np.array(actual_pos[:3]) if len(actual_pos) >= 3 else np.array(actual_pos)
+                        if hasattr(self, 'logger') and self.logger:
+                            self.logger.debug(
+                                "[AgentMemory] get_object_list: using actual position for goal_position_id=%d: %s",
+                                object_id,
+                                position,
+                            )
+                except Exception as exc:
+                    if hasattr(self, 'logger') and self.logger:
+                        self.logger.debug(
+                            "[AgentMemory] get_object_list: failed to get actual position for goal_position_id=%d: %s, falling back to cal_object_position",
+                            object_id,
+                            exc,
+                        )
+            
+            # If position not obtained from object_manager, calculate from depth map
+            if position is None:
+                position, pc = self.cal_object_position(o_dict)
+                # If calculated position is outside map bounds and this is goal_position_id, try to get actual position
+                if position is not None and goal_position_id is not None and object_id == goal_position_id:
+                    if self._scene_bounds is not None:
+                        x, y, z = position[0], position[1] if len(position) > 1 else 0, position[2] if len(position) > 2 else position[1]
+                        bounds = self._scene_bounds
+                        x_min = bounds.get("x_min")
+                        x_max = bounds.get("x_max")
+                        z_min = bounds.get("z_min")
+                        z_max = bounds.get("z_max")
+                        if (x_min is not None and x_max is not None and (x < x_min or x > x_max)) or \
+                           (z_min is not None and z_max is not None and (z < z_min or z > z_max)):
+                            # Calculated position is outside map, try to get actual position
+                            if get_goal_position_func is not None:
+                                try:
+                                    actual_pos = get_goal_position_func()
+                                    if actual_pos is not None:
+                                        position = np.array(actual_pos[:3]) if len(actual_pos) >= 3 else np.array(actual_pos)
+                                        if hasattr(self, 'logger') and self.logger:
+                                            self.logger.info(
+                                                "[AgentMemory] get_object_list: calculated position for goal_position_id=%d was outside map (%s), using actual position: %s",
+                                                object_id,
+                                                (x, y, z),
+                                                position,
+                                            )
+                                except Exception:
+                                    pass
 
             if position is None:
                 # Too far from the agent

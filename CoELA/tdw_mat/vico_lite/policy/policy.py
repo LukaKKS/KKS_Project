@@ -159,8 +159,19 @@ class ViCoPolicy:
             if prev_status == 1:
                 if self.logger:
                     self.logger.info("[Policy] pick success id=%s frame=%s", pick_id, frame)
-                # Add successfully picked object to skip_targets to prevent re-picking
+                # Add successfully picked object to holding_ids immediately
+                # This is necessary because held_objects may not be updated in the same frame
                 if pick_id is not None:
+                    current_holding_ids = self.agent_state.get("holding_ids", [])
+                    if pick_id not in current_holding_ids:
+                        current_holding_ids.append(pick_id)
+                        self.agent_state["holding_ids"] = current_holding_ids
+                        if self.logger:
+                            self.logger.info(
+                                "[Policy] pick success: added to holding_ids id=%s holding_ids=%s",
+                                pick_id,
+                                current_holding_ids,
+                            )
                     # Get object name from visible_objects or object_info
                     obj_name = None
                     if self.agent_memory is not None and hasattr(self.agent_memory, "object_info"):
@@ -351,7 +362,25 @@ class ViCoPolicy:
         if plan is None:
             plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "no_plan"})
         plan = self._ensure_plan_target(plan)
+        # Clamp LLM-generated coordinates to valid room positions before checking
+        if plan.target_position is not None and guidance.source == "llm":
+            # Use executor's clamp method to ensure coordinates are within valid room
+            clamped_pos = self.executor._clamp_target(plan.target_position)
+            if clamped_pos != plan.target_position:
+                if self.logger:
+                    self.logger.debug(
+                        "[Policy] clamped LLM target from %s to %s",
+                        plan.target_position,
+                        clamped_pos,
+                    )
+                # Update plan with clamped position
+                meta = dict(plan.meta)
+                meta["original_target"] = plan.target_position
+                meta["clamped"] = True
+                plan = ReasonedPlan(plan.action_type, plan.target_id, clamped_pos, plan.confidence, meta)
         # Reject plans with targets outside map boundaries and add to skip_targets
+        # Exception: if is_goal_position=True, clamp the position instead of rejecting
+        is_goal_position = plan.meta.get("is_goal_position", False)
         if plan.target_position is not None and self.agent_memory is not None:
             target_pos = plan.target_position
             rejected = False
@@ -365,27 +394,65 @@ class ViCoPolicy:
                     z_max = bounds.get("z_max")
                     if (x_min is not None and x_max is not None and (x < x_min or x > x_max)) or \
                        (z_min is not None and z_max is not None and (z < z_min or z > z_max)):
-                        if self.logger:
-                            self.logger.warning(
-                                "[Policy] rejecting plan with target outside map bounds: %s (bounds: x=[%s, %s], z=[%s, %s])",
-                                target_pos,
-                                x_min, x_max, z_min, z_max,
-                            )
-                        # Add to skip_targets to prevent LLM from suggesting it again
-                        self._register_skip_target(position=target_pos)
-                        plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "target_outside_map_bounds"})
-                        rejected = True
+                        if is_goal_position:
+                            # For goal_position, clamp the position instead of rejecting
+                            clamped_x = min(max(x, x_min + 0.5), x_max - 0.5) if x_min is not None and x_max is not None else x
+                            clamped_z = min(max(z, z_min + 0.5), z_max - 0.5) if z_min is not None and z_max is not None else z
+                            clamped_pos = (clamped_x, y, clamped_z)
+                            if self.logger:
+                                self.logger.info(
+                                    "[Policy] goal_position target outside map bounds, clamping from %s to %s",
+                                    target_pos,
+                                    clamped_pos,
+                                )
+                            meta = dict(plan.meta)
+                            meta["original_target"] = target_pos
+                            meta["clamped"] = True
+                            plan = ReasonedPlan(plan.action_type, plan.target_id, clamped_pos, plan.confidence, meta)
+                        else:
+                            if self.logger:
+                                self.logger.warning(
+                                    "[Policy] rejecting plan with target outside map bounds: %s (bounds: x=[%s, %s], z=[%s, %s])",
+                                    target_pos,
+                                    x_min, x_max, z_min, z_max,
+                                )
+                            # Add to skip_targets to prevent LLM from suggesting it again
+                            self._register_skip_target(position=target_pos)
+                            plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "target_outside_map_bounds"})
+                            rejected = True
             # Also check with check_pos_in_room if available
             if not rejected and plan.target_position is not None and self.env_api and "check_pos_in_room" in self.env_api:
                 if not self.env_api["check_pos_in_room"]((target_pos[0], target_pos[2])):
-                    if self.logger:
-                        self.logger.warning(
-                            "[Policy] rejecting plan with target outside room: %s (adding to skip_targets)",
-                            target_pos,
-                        )
-                    # Add to skip_targets to prevent LLM from suggesting it again
-                    self._register_skip_target(position=target_pos)
-                    plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "target_outside_room"})
+                    if is_goal_position:
+                        # For goal_position, try to use executor's clamp_target to find a valid position
+                        clamped_pos = self.executor._clamp_target(target_pos)
+                        if clamped_pos != target_pos:
+                            if self.logger:
+                                self.logger.info(
+                                    "[Policy] goal_position target outside room, clamped from %s to %s",
+                                    target_pos,
+                                    clamped_pos,
+                                )
+                            meta = dict(plan.meta)
+                            meta["original_target"] = target_pos
+                            meta["clamped"] = True
+                            plan = ReasonedPlan(plan.action_type, plan.target_id, clamped_pos, plan.confidence, meta)
+                        else:
+                            if self.logger:
+                                self.logger.warning(
+                                    "[Policy] goal_position target outside room and cannot clamp, rejecting"
+                                )
+                            plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "target_outside_room"})
+                            rejected = True
+                    else:
+                        if self.logger:
+                            self.logger.warning(
+                                "[Policy] rejecting plan with target outside room: %s (adding to skip_targets)",
+                                target_pos,
+                            )
+                        # Add to skip_targets to prevent LLM from suggesting it again
+                        self._register_skip_target(position=target_pos)
+                        plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "target_outside_room"})
         if plan.action_type != "idle" and guidance.source == "llm":
             self.last_reasoner_frame = frame
             if self.logger:
@@ -407,6 +474,10 @@ class ViCoPolicy:
             self.agent_state["last_command"] = "pick"
             self.agent_state["last_pick_id"] = command.get("object", plan.target_id)
             self.agent_state["last_pick_pos"] = plan.target_position
+        elif command_type == 4:
+            self.agent_state["last_command"] = "deliver"
+            self.agent_state["last_deliver_id"] = plan.target_id
+            self.agent_state["last_deliver_pos"] = plan.target_position
         elif command_type not in (None, "ongoing"):
             self.agent_state["last_command"] = str(command_type)
         if exec_meta.get("forced_failure"):
@@ -444,6 +515,15 @@ class ViCoPolicy:
                 rgb_array = rgb_array.astype(np.float32) / 255.0
             rgb_tensor = torch.from_numpy(rgb_array)
         visible = obs.get("visible_objects", [])
+        if self.logger and getattr(self.logger, "debug", None):
+            if not hasattr(self, '_logged_visible_empty'):
+                self._logged_visible_empty = False
+            if not visible and not self._logged_visible_empty:
+                self.logger.debug(
+                    "[Policy] _prepare_perception_inputs: obs['visible_objects'] is empty (len=%d)",
+                    len(visible) if visible else 0,
+                )
+                self._logged_visible_empty = True
         object_names = [item.get("name", "") for item in visible]
         agent_pos = None
         if "agent" in obs:
@@ -455,7 +535,11 @@ class ViCoPolicy:
         for item in visible:
             obj_id = item.get("id")
             obj_name = item.get("name")
+            obj_type = item.get("type")
             if obj_id is None:
+                continue
+            # Filter out agent objects (type=3 or name="agent" or id matches agent_id)
+            if obj_type == 3 or (isinstance(obj_name, str) and obj_name.lower() == "agent") or obj_id == self.agent_id:
                 continue
             if obj_name is None or (isinstance(obj_name, str) and obj_name.strip() == ""):
                 continue
@@ -464,6 +548,7 @@ class ViCoPolicy:
                 "name": obj_name,
                 "category": item.get("category"),
                 "visible": item.get("visible", True),
+                "seg_color": item.get("seg_color"),  # Add seg_color for distance estimation
             }
             position = item.get("position", None)
             location = item.get("location", None)
@@ -630,17 +715,60 @@ class ViCoPolicy:
     def _update_agent_state(self, obs: Dict[str, Any]) -> None:
         holding_ids = []
         holding_slots: Dict[str, Optional[int]] = {}
-        for entry in obs.get("held_objects", []) or []:
+        held_objects = obs.get("held_objects", []) or []
+        if self.logger and getattr(self.logger, "debug", None):
+            self.logger.debug(
+                "[Policy] _update_agent_state: held_objects=%s (type=%s)",
+                held_objects,
+                type(held_objects).__name__,
+            )
+        valid_held_objects = False
+        for entry in held_objects:
             if not entry:
                 continue
             obj_id = entry.get("id")
             arm_name = entry.get("arm")
             if obj_id is not None:
                 holding_ids.append(obj_id)
+                valid_held_objects = True
             if isinstance(arm_name, str):
                 holding_slots[arm_name.lower()] = obj_id
+        
+        # Check if put_in was successful (status == 1 and last_command was deliver)
+        prev_status = obs.get("status")
+        last_command = self.agent_state.get("last_command")
+        if isinstance(prev_status, int) and last_command == "deliver" and prev_status == 1:
+            # put_in was successful, clear holding_ids
+            if self.logger:
+                self.logger.info(
+                    "[Policy] deliver success: clearing holding_ids (was %s)",
+                    self.agent_state.get("holding_ids", []),
+                )
+            holding_ids = []
+            holding_slots = {}
+            valid_held_objects = False  # Don't preserve existing holding_ids
+        
+        # If held_objects is empty or all None, preserve existing holding_ids
+        # This is important because pick success may have just added an object,
+        # but obs["held_objects"] may not be updated yet
+        # However, don't preserve if put_in was successful (handled above)
+        if not valid_held_objects and not (isinstance(prev_status, int) and last_command == "deliver" and prev_status == 1):
+            existing_holding_ids = self.agent_state.get("holding_ids", [])
+            if existing_holding_ids:
+                holding_ids = existing_holding_ids
+                if self.logger:
+                    self.logger.debug(
+                        "[Policy] _update_agent_state: held_objects empty, preserving existing holding_ids=%s",
+                        holding_ids,
+                    )
         self.agent_state["holding_ids"] = holding_ids
         self.agent_state["holding_slots"] = holding_slots
+        if self.logger and holding_ids:
+            self.logger.debug(
+                "[Policy] _update_agent_state: updated holding_ids=%s holding_slots=%s",
+                holding_ids,
+                holding_slots,
+            )
         if self.env_api and "belongs_to_which_room" in self.env_api:
             position = obs.get("agent")
             if isinstance(position, np.ndarray) or isinstance(position, list):
@@ -669,10 +797,19 @@ class ViCoPolicy:
                 self.active_target = plan.target_position
                 self.target_acquire_frame = self.agent_state.get("frame", -999)
                 return plan
-            meta = dict(plan.meta)
-            meta["fallback"] = "explore"
-            meta["reason"] = f"redirect_from_blocked:{meta.get('target_name')}"
-            plan = ReasonedPlan("search", None, None, max(plan.confidence * 0.5, 0.2), meta)
+            # Don't redirect if this is a goal_position (we need to reach it)
+            if plan.meta.get("is_goal_position", False):
+                if self.logger:
+                    self.logger.debug(
+                        "[Policy] target blocked but is_goal_position=True, keeping original plan"
+                    )
+                # Keep the original plan but with lower confidence
+                plan = ReasonedPlan(plan.action_type, plan.target_id, plan.target_position, max(plan.confidence * 0.7, 0.3), plan.meta)
+            else:
+                meta = dict(plan.meta)
+                meta["fallback"] = "explore"
+                meta["reason"] = f"redirect_from_blocked:{meta.get('target_name')}"
+                plan = ReasonedPlan("search", None, None, max(plan.confidence * 0.5, 0.2), meta)
             self.active_target = None
 
         if self.active_target is not None:
@@ -900,11 +1037,50 @@ class ViCoPolicy:
                             info["distance"] = float(np.linalg.norm(agent_pos - pos_arr))
                     except Exception:
                         pass
+                # If position is None but we have seg_color, try to estimate distance from depth
+                elif position is None and info.get("seg_color") is not None and self.agent_memory is not None:
+                    try:
+                        seg_color = info.get("seg_color")
+                        if seg_color is not None and hasattr(self.agent_memory, "obs") and self.agent_memory.obs is not None:
+                            depth = self.agent_memory.obs.get("depth")
+                            seg_mask = self.agent_memory.obs.get("seg_mask")
+                            if depth is not None and seg_mask is not None:
+                                # Find matched pixels
+                                if isinstance(seg_color, (tuple, list)):
+                                    seg_color = np.array(seg_color, dtype=seg_mask.dtype)
+                                if seg_mask.ndim == 3:
+                                    color_match = np.all(seg_mask == seg_color, axis=-1)
+                                    matched_depth = depth[color_match]
+                                    # Filter valid depths
+                                    valid_matched_depth = matched_depth[(matched_depth > 0) & (matched_depth < 100)]
+                                    if len(valid_matched_depth) > 0:
+                                        # Use median depth as distance estimate
+                                        estimated_depth = float(np.median(valid_matched_depth))
+                                        info["distance"] = estimated_depth
+                                        if self.logger:
+                                            self.logger.debug(
+                                                "[Policy] _maybe_force_pick: estimated distance from depth: id=%s name=%s dist=%.2f",
+                                                obj_id,
+                                                info.get("name"),
+                                                estimated_depth,
+                                            )
+                    except Exception as exc:
+                        if self.logger:
+                            self.logger.debug(
+                                "[Policy] _maybe_force_pick: distance estimation failed: id=%s name=%s error=%s",
+                                obj_id,
+                                info.get("name"),
+                                exc,
+                            )
             # For task targets, be more lenient - allow pick even without position if we have distance
             if position is None:
                 # If it's a task target and we have distance, we can still try to pick (will use object_id only)
                 if info.get("is_task_target") and info.get("distance") is not None:
                     # Allow it, but we'll need to handle this in executor
+                    pass
+                # If we have distance estimate (even if not task target), allow for grabbable objects
+                elif info.get("distance") is not None and info.get("is_grabbable"):
+                    # Allow it - we have distance estimate from depth
                     pass
                 else:
                     filtered_reasons["no_position"] = filtered_reasons.get("no_position", 0) + 1
@@ -913,7 +1089,10 @@ class ViCoPolicy:
                 filtered_reasons["no_distance"] = filtered_reasons.get("no_distance", 0) + 1
                 continue
             distance = float(info["distance"])
-            max_distance = 4.5 if info.get("is_task_target") else 3.0
+            # Increase max_distance to allow navigation to objects
+            # For task targets: allow up to 10m (executor will navigate)
+            # For other grabbables: allow up to 8m (executor will navigate)
+            max_distance = 10.0 if info.get("is_task_target") else 8.0
             if not np.isfinite(distance) or distance > max_distance:
                 filtered_reasons["too_far"] = filtered_reasons.get("too_far", 0) + 1
                 continue
@@ -1044,7 +1223,15 @@ class ViCoPolicy:
         """Force a deliver action if holding objects and a nearby container is visible."""
         holding_ids = self.agent_state.get("holding_ids", [])
         if not holding_ids:
+            if self.logger:
+                self.logger.debug("[Policy] _maybe_force_deliver: no holding_ids")
             return None
+        if self.logger:
+            self.logger.debug(
+                "[Policy] _maybe_force_deliver: holding_ids=%s visible_infos=%d",
+                holding_ids,
+                len(object_infos),
+            )
         agent_pos = None
         if hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
             try:
@@ -1053,12 +1240,262 @@ class ViCoPolicy:
                 pass
         if agent_pos is None:
             return None
+        # If no containers in visible_infos, try to find containers in agent_memory.object_info
+        if not any(info.get("is_task_container", False) for info in object_infos):
+            # Try to find containers in agent_memory.object_info
+            if self.agent_memory is not None and hasattr(self.agent_memory, "object_info"):
+                container_candidates = []
+                task_container_names = {str(n).lower() for n in self.agent_state.get("task_containers", [])}
+                
+                # Always check for goal_position_id first (this is the actual deliver target)
+                goal_position_id = None
+                # env_api can be a dict or an object, so check both ways
+                if self.env_api is not None:
+                    # Try dict access first (most common case)
+                    if isinstance(self.env_api, dict):
+                        goal_position_id = self.env_api.get("goal_position_id")
+                    # Try attribute access (if it's an object)
+                    elif hasattr(self.env_api, "goal_position_id"):
+                        goal_position_id = self.env_api.goal_position_id
+                    
+                    if goal_position_id is not None:
+                        if self.logger:
+                            self.logger.info(
+                                "[Policy] _maybe_force_deliver: found goal_position_id=%s (type=%s, env_api_type=%s)",
+                                goal_position_id,
+                                type(goal_position_id).__name__,
+                                type(self.env_api).__name__,
+                            )
+                    elif self.logger:
+                        self.logger.debug(
+                            "[Policy] _maybe_force_deliver: goal_position_id not found in env_api (type=%s, keys=%s)",
+                            type(self.env_api).__name__,
+                            list(self.env_api.keys()) if isinstance(self.env_api, dict) else "N/A",
+                        )
+                
+                # If task_containers is empty, try to get container_ids from env_api
+                if not task_container_names and self.env_api is not None:
+                    # Try to get container_ids from env_api
+                    container_ids = None
+                    if isinstance(self.env_api, dict):
+                        container_ids = self.env_api.get("container_ids")
+                    elif hasattr(self.env_api, "container_ids"):
+                        container_ids = self.env_api.container_ids
+                    
+                    if container_ids:
+                        # Use container_ids as valid container IDs
+                        valid_container_ids = set(container_ids)
+                        if self.logger:
+                            self.logger.debug(
+                                "[Policy] _maybe_force_deliver: task_containers empty, using env_api.container_ids=%s",
+                                list(valid_container_ids),
+                            )
+                    elif goal_position_id is not None:
+                        # Use goal_position_id as the container
+                        valid_container_ids = {goal_position_id}
+                        if self.logger:
+                            self.logger.debug(
+                                "[Policy] _maybe_force_deliver: task_containers empty, using goal_position_id=%s",
+                                goal_position_id,
+                            )
+                    else:
+                        valid_container_ids = None
+                else:
+                    valid_container_ids = None
+                
+                if self.logger:
+                    self.logger.debug(
+                        "[Policy] _maybe_force_deliver: searching memory for containers task_containers=%s object_info_count=%d valid_container_ids=%s",
+                        list(task_container_names),
+                        len(getattr(self.agent_memory, "object_info", {})),
+                        list(valid_container_ids) if valid_container_ids else None,
+                    )
+                # Collect all object names for debugging
+                all_obj_names = []
+                for obj_id, obj_info in getattr(self.agent_memory, "object_info", {}).items():
+                    if obj_id is None:
+                        continue
+                    obj_name = str(obj_info.get("name", "")).lower() if obj_info.get("name") else ""
+                    obj_type = obj_info.get("type")
+                    obj_category = str(obj_info.get("category", "")).lower() if obj_info.get("category") else ""
+                    all_obj_names.append((obj_id, obj_name, obj_type, obj_category))
+                    
+                    # Check if this object is a container
+                    is_container = False
+                    # PRIORITY 1: Always treat goal_position_id as a container (highest priority)
+                    if goal_position_id is not None and obj_id == goal_position_id:
+                        is_container = True
+                    elif task_container_names:
+                        # Exact match
+                        if obj_name in task_container_names:
+                            is_container = True
+                        # Partial match: check if any task_container name is contained in obj_name or vice versa
+                        elif any(tc_name in obj_name or obj_name in tc_name for tc_name in task_container_names if tc_name and obj_name):
+                            is_container = True
+                    if not is_container and valid_container_ids is not None and obj_id in valid_container_ids:
+                        is_container = True
+                    # Type-based: Type 1 is container, but also check type 2 (beds, tables, etc. can be containers)
+                    if not is_container and (obj_type == 1 or obj_type == 2):
+                        # For type 2, only consider if it's a known container category
+                        if obj_type == 1:
+                            is_container = True
+                        elif obj_type == 2:
+                            # Type 2 can be beds, tables, etc. - check name/category
+                            if any(keyword in obj_name for keyword in ["bed", "table", "counter", "cabinet", "fridge", "stove", "dishwasher", "microwave", "plate", "bowl", "tray"]):
+                                is_container = True
+                    if not is_container and ("container" in obj_category or obj_category in ["bed", "table", "counter", "cabinet", "fridge", "stove", "dishwasher", "microwave"]):
+                        is_container = True
+                    # Also check if name contains container-related keywords
+                    if not is_container:
+                        container_keywords = ["plate", "bowl", "tray", "dish", "container", "cabinet", "fridge", "stove", "microwave", "dishwasher"]
+                        if any(keyword in obj_name for keyword in container_keywords):
+                            is_container = True
+                    
+                    if is_container:
+                        obj_pos = obj_info.get("position")
+                        if obj_pos is None:
+                            if self.logger:
+                                self.logger.debug(
+                                    "[Policy] _maybe_force_deliver: container id=%s name=%s type=%s has no position",
+                                    obj_id,
+                                    obj_name,
+                                    obj_type,
+                                )
+                        else:
+                            obj_pos = self._normalise_position(obj_pos)
+                            if obj_pos is None:
+                                if self.logger:
+                                    self.logger.debug(
+                                        "[Policy] _maybe_force_deliver: container id=%s name=%s type=%s position normalized to None",
+                                        obj_id,
+                                        obj_name,
+                                        obj_type,
+                                    )
+                            else:
+                                try:
+                                    pos_arr = np.asarray(obj_pos, dtype=np.float32)
+                                    if pos_arr.shape[0] >= 3 and agent_pos.shape[0] >= 3:
+                                        distance = float(np.linalg.norm(agent_pos[[0, 2]] - pos_arr[[0, 2]]))
+                                    else:
+                                        distance = float(np.linalg.norm(agent_pos - pos_arr))
+                                except Exception:
+                                    distance = 999.0
+                                # Distance limits:
+                                # - If this is goal_position_id, no distance limit (it's the actual target)
+                                # - For type 2 (beds, tables), allow larger distance (20m) since they're fixed furniture
+                                # - For other containers, use standard 10m limit
+                                if goal_position_id is not None and obj_id == goal_position_id:
+                                    max_distance = float('inf')  # No limit for goal_position_id
+                                elif obj_type == 2:
+                                    max_distance = 20.0  # Limit for beds/tables
+                                else:
+                                    max_distance = 10.0
+                                if np.isfinite(distance) and distance <= max_distance:
+                                    container_candidates.append((distance, obj_id, obj_pos, obj_name))
+                                    if self.logger:
+                                        self.logger.debug(
+                                            "[Policy] _maybe_force_deliver: found container candidate id=%s name=%s type=%s dist=%.2f",
+                                            obj_id,
+                                            obj_name,
+                                            obj_type,
+                                            distance,
+                                        )
+                                elif self.logger:
+                                    self.logger.debug(
+                                        "[Policy] _maybe_force_deliver: container id=%s name=%s type=%s too far (dist=%.2f > %.2f)",
+                                        obj_id,
+                                        obj_name,
+                                        obj_type,
+                                        distance,
+                                        max_distance,
+                                    )
+                if container_candidates:
+                    # Sort by distance and pick the closest one
+                    container_candidates.sort(key=lambda x: x[0])
+                    best_distance, best_id, best_pos, best_name = container_candidates[0]
+                    
+                    # If this is goal_position_id, try to get actual position from env_api if available
+                    if goal_position_id is not None and best_id == goal_position_id:
+                        # Try to get actual position from env_api (if it has access to object_manager)
+                        # For now, use the position from memory but log it
+                        if self.logger:
+                            self.logger.info(
+                                "[Policy] overriding with deliver id=%s name=%s (goal_position_id) dist=%.2f pos=%s",
+                                best_id,
+                                best_name,
+                                best_distance,
+                                best_pos,
+                            )
+                    else:
+                        if self.logger:
+                            self.logger.info(
+                                "[Policy] overriding with deliver id=%s name=%s (from memory) dist=%.2f",
+                                best_id,
+                                best_name,
+                                best_distance,
+                            )
+                    meta = {
+                        "reason": "policy_override_deliver_memory",
+                        "target_name": best_name,
+                        "distance": best_distance,
+                        "is_goal_position": (goal_position_id is not None and best_id == goal_position_id),
+                    }
+                    return ReasonedPlan("deliver", best_id, best_pos, 0.9, meta)
+                # If no candidates found but goal_position_id exists and is too far, return move plan
+                elif goal_position_id is not None:
+                    # Find goal_position_id in memory even if it was filtered out
+                    goal_obj_info = None
+                    for obj_id, obj_info in getattr(self.agent_memory, "object_info", {}).items():
+                        if obj_id == goal_position_id:
+                            goal_obj_info = obj_info
+                            break
+                    if goal_obj_info is not None:
+                        goal_pos = goal_obj_info.get("position")
+                        if goal_pos is not None:
+                            goal_pos = self._normalise_position(goal_pos)
+                            if goal_pos is not None:
+                                goal_name = str(goal_obj_info.get("name", "goal_position")).lower()
+                                try:
+                                    pos_arr = np.asarray(goal_pos, dtype=np.float32)
+                                    if pos_arr.shape[0] >= 3 and agent_pos.shape[0] >= 3:
+                                        goal_distance = float(np.linalg.norm(agent_pos[[0, 2]] - pos_arr[[0, 2]]))
+                                    else:
+                                        goal_distance = float(np.linalg.norm(agent_pos - pos_arr))
+                                except Exception:
+                                    goal_distance = 999.0
+                                # If goal_position_id is too far, return move plan to navigate to it
+                                if self.logger:
+                                    self.logger.info(
+                                        "[Policy] goal_position_id=%s (name=%s) too far (dist=%.2f), returning move plan",
+                                        goal_position_id,
+                                        goal_name,
+                                        goal_distance,
+                                    )
+                                meta = {
+                                    "reason": "policy_override_move_to_goal",
+                                    "target_name": goal_name,
+                                    "distance": goal_distance,
+                                    "is_goal_position": True,
+                                }
+                                return ReasonedPlan("move", goal_position_id, goal_pos, 0.9, meta)
+                if self.logger:
+                    # Log sample of object names for debugging
+                    sample_names = [(id, name, type) for id, name, type, _ in all_obj_names[:10]]
+                    self.logger.debug(
+                        "[Policy] _maybe_force_deliver: no container candidates found in memory (task_containers=%s, sample_obj_names=%s)",
+                        list(task_container_names),
+                        sample_names,
+                    )
         skip_targets = self.agent_state.get("skip_targets", {"names": set(), "coords": set()})
         skip_names = {str(n).lower() for n in skip_targets.get("names", [])}
         blocked_coords = set()
         for coord in skip_targets.get("coords", []):
             if isinstance(coord, (list, tuple)) and len(coord) >= 2:
-                blocked_coords.add((round(float(coord[0]), 2), round(float(coord[2]), 2)))
+                # coord can be [x, z] (2 elements) or [x, y, z] (3 elements)
+                if len(coord) >= 3:
+                    blocked_coords.add((round(float(coord[0]), 2), round(float(coord[2]), 2)))
+                else:
+                    blocked_coords.add((round(float(coord[0]), 2), round(float(coord[1]), 2)))
         candidates = []
         filtered_reasons = {}
         for info in object_infos:
@@ -1108,7 +1545,9 @@ class ViCoPolicy:
                     filtered_reasons["no_distance"] = filtered_reasons.get("no_distance", 0) + 1
                     continue
             distance = float(info["distance"])
-            max_distance = 5.0
+            # Increase max_distance to allow navigation to containers
+            # Executor will handle navigation, so we can allow further containers
+            max_distance = 10.0
             if not np.isfinite(distance) or distance > max_distance:
                 filtered_reasons["too_far"] = filtered_reasons.get("too_far", 0) + 1
                 continue

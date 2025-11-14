@@ -3,7 +3,7 @@ set -e
 
 MODEL=${MODEL:-"gpt-4o-mini"}
 RUN_ID=${RUN_ID:-"vico_agent_test"}
-EPISODES=${EPISODES:-1}
+EPISODES=${EPISODES:-0}
 PORT=${PORT:-1071}
 
 ENV_FILE="/Users/giseong/Desktop/multi_agent/vico/.env"
