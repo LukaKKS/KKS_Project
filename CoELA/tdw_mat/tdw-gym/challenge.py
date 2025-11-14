@@ -25,7 +25,7 @@ gym.envs.registration.register(
 
 class Challenge:
     def __init__(self, logger, port, data_path, output_dir, number_of_agents = 2, max_frames = 3000, launch_build = True, screen_size = 512, data_prefix = 'dataset/nips_dataset/', gt_mask = True, save_img = True):
-        self.env = gym.make("transport_challenge_MA", port = port, number_of_agents = number_of_agents, save_dir = output_dir, max_frames = max_frames, launch_build = launch_build, screen_size = screen_size, data_prefix = data_prefix, gt_mask = gt_mask)
+        self.env = gym.make("transport_challenge_MA", port = port, number_of_agents = number_of_agents, save_dir = output_dir, max_frames = max_frames, launch_build = launch_build, screen_size = screen_size, data_prefix = data_prefix, gt_mask = gt_mask, logger = logger)
         self.gt_mask = gt_mask
         self.logger = logger
         self.logger.debug(port)

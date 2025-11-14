@@ -269,34 +269,10 @@ class AgentMemory():
         xx = (xx - cx) / fx * depth
         yy = (yy - cy) / fy * depth
 
-        # First, check depth range for matched pixels to determine appropriate threshold
-        max_depth = 20.0  # Default max depth
-        if seg_mask.ndim == 3:
-            color_match = np.all(seg_mask == color, axis=-1)
-            matched_depth = depth[color_match]
-            # Filter out invalid depths (0, negative, or 1e9)
-            valid_matched_depth = matched_depth[(matched_depth > 0) & (matched_depth < 1e8)]
-            if len(valid_matched_depth) > 0:
-                # If matched pixels have depth > 20m, extend the range
-                max_matched_depth = valid_matched_depth.max()
-                if max_matched_depth > 20.0:
-                    # Extend to 1.5x the max depth, but cap at 100m for safety
-                    max_depth = min(max_matched_depth * 1.5, 100.0)
-                    if hasattr(self, 'logger') and self.logger:
-                        color_key = tuple(color) if isinstance(color, np.ndarray) else color
-                        if not hasattr(self, '_logged_depth_extensions'):
-                            self._logged_depth_extensions = set()
-                        if color_key not in self._logged_depth_extensions:
-                            self.logger.debug(
-                                "[AgentMemory] get_pc: extending depth range to %.2fm for color=%s (max_matched=%.2f)",
-                                max_depth,
-                                color,
-                                max_matched_depth,
-                            )
-                            self._logged_depth_extensions.add(color_key)
-
-        # Relax depth constraint: allow objects up to max_depth (default 20m, can extend up to 100m)
-        # This helps with objects that are further but still visible
+        # COELA-style: Use 10m depth limit (same as COELA's h_agent and lm_agent)
+        # Depth accuracy degrades significantly beyond 10m, leading to incorrect position calculations
+        # COELA uses hardcoded depth < 10, we use max_depth = 10.0 for consistency
+        max_depth = 10.0  # COELA-style: 10m limit (no extension)
         index = np.where((depth > 0) & (depth < max_depth))
         valid_count = len(index[0])
         
@@ -389,10 +365,9 @@ class AgentMemory():
         try:
             seg_color = o_dict['seg_color']
             pc = self.get_pc(seg_color)
-            # Allow position calculation with as few as 1 point
-            # This is crucial for small objects or objects with partial visibility
-            # Even 1-2 points can provide a useful position estimate
-            if pc is None or pc.shape[1] < 1:
+            # COELA-style: Require at least 5 points for reliable position calculation
+            # Single points or very few points lead to inaccurate positions, especially at long distances
+            if pc is None or pc.shape[1] < 5:
                 # Log why it failed (only once per object per frame to reduce log spam)
                 obj_id = o_dict.get('id')
                 if hasattr(self, 'logger') and self.logger:
@@ -401,7 +376,7 @@ class AgentMemory():
                         self._logged_failed_objects = set()
                     if obj_id not in self._logged_failed_objects:
                         self.logger.debug(
-                            "[AgentMemory] cal_object_position failed: id=%s name=%s pc_shape=%s",
+                            "[AgentMemory] cal_object_position failed: id=%s name=%s pc_shape=%s (need at least 5 points, COELA-style)",
                             obj_id,
                             o_dict.get('name'),
                             pc.shape if pc is not None else None,
@@ -409,8 +384,42 @@ class AgentMemory():
                         self._logged_failed_objects.add(obj_id)
                 return None, None
             
+            # Calculate position using mean (COELA-style)
             position = pc.mean(1)
-            return position[:3], pc
+            pos_3d = position[:3]
+            
+            # Validate position against map bounds (COELA-style filtering)
+            # This prevents storing invalid positions that are outside the map
+            if self._scene_bounds is not None and pos_3d is not None:
+                x, y, z = pos_3d[0], pos_3d[1] if len(pos_3d) > 1 else 0, pos_3d[2] if len(pos_3d) > 2 else pos_3d[1]
+                bounds = self._scene_bounds
+                x_min = bounds.get("x_min")
+                x_max = bounds.get("x_max")
+                z_min = bounds.get("z_min")
+                z_max = bounds.get("z_max")
+                # Check if position is outside map bounds
+                if (x_min is not None and x_max is not None and (x < x_min or x > x_max)) or \
+                   (z_min is not None and z_max is not None and (z < z_min or z > z_max)):
+                    # Position is outside map bounds - reject it
+                    obj_id = o_dict.get('id')
+                    if hasattr(self, 'logger') and self.logger:
+                        if not hasattr(self, '_logged_out_of_bounds'):
+                            self._logged_out_of_bounds = set()
+                        if obj_id not in self._logged_out_of_bounds:
+                            self.logger.debug(
+                                "[AgentMemory] cal_object_position: calculated position %s for id=%s name=%s is outside map bounds (x=[%.1f, %.1f], z=[%.1f, %.1f]), rejecting",
+                                pos_3d,
+                                obj_id,
+                                o_dict.get('name'),
+                                x_min if x_min is not None else -999,
+                                x_max if x_max is not None else 999,
+                                z_min if z_min is not None else -999,
+                                z_max if z_max is not None else 999,
+                            )
+                            self._logged_out_of_bounds.add(obj_id)
+                    return None, None
+            
+            return pos_3d, pc
         except Exception as exc:
             if hasattr(self, 'logger') and self.logger:
                 self.logger.warning(

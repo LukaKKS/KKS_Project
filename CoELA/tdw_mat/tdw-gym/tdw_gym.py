@@ -49,7 +49,7 @@ def might_fail_launch(launch, port = None):
 
 class TDW(Env):
     def __init__(self, port = 1071, number_of_agents = 1, demo=False, rank=0, num_scenes = 0, train=False, \
-                        screen_size = 512, exp = False, launch_build=True, gt_occupancy = False, gt_mask = True, enable_collision_detection = False, save_dir = 'results', max_frames = 3000, data_prefix = 'dataset/nips_dataset/'):
+                        screen_size = 512, exp = False, launch_build=True, gt_occupancy = False, gt_mask = True, enable_collision_detection = False, save_dir = 'results', max_frames = 3000, data_prefix = 'dataset/nips_dataset/', logger=None):
         self.messages = None
         self.data_prefix = data_prefix
         self.replicant_colors = None
@@ -83,6 +83,7 @@ class TDW(Env):
         self.enable_collision_detection = enable_collision_detection
         self.controller = None
         self.message_per_frame = 500
+        self.logger = logger
         rgb_space = gym.spaces.Box(0, 256,
                                  (3,
                                   self.screen_size,
@@ -102,7 +103,7 @@ class TDW(Env):
         })
 
         self.action_space_single = gym.spaces.Dict({
-            'type': gym.spaces.Discrete(7), # please refer to line 192-210
+            'type': gym.spaces.Discrete(10), # 0-2: discrete movement, 3-8: actions, 9: continuous movement
             'object': gym.spaces.Discrete(30),
             'arm': gym.spaces.Discrete(2),
             'message': gym.spaces.Text(max_length=1000, charset=string.printable)
@@ -648,9 +649,62 @@ class TDW(Env):
         '''
         start = time.time()
         # Receive actions
+        # Initialize delay_frame_count before processing actions
+        delay_frame_count = [0 for _ in range(self.number_of_agents)]
         for replicant_id in self.controller.replicants:
             action = actions[str(replicant_id)]
             if action['type'] == 'ongoing': continue
+            
+            # 핵심 수정: type: 9 (continuous movement)가 이미 진행 중이면 새 액션 무시
+            # 이전 move_to_position이 완료되기 전에 새로운 move_to_position이 들어오면 이전 액션이 취소되는 문제 해결
+            if action["type"] == 9:
+                # 현재 action_buffer에 move_to_position이 있는지 확인
+                has_move_to_position = any(
+                    buf_action.get('type') == 'move_to_position' 
+                    for buf_action in self.action_buffer[replicant_id]
+                )
+                # 또는 현재 실행 중인 액션이 move_to_position인지 확인
+                current_action_ongoing = (
+                    self.controller.replicants[replicant_id].action.status == ActionStatus.ongoing
+                )
+                # 같은 target_position으로 이동 중인지 확인 (중복 방지)
+                new_target_pos = action.get("target_position")
+                if new_target_pos is not None:
+                    try:
+                        if isinstance(new_target_pos, (list, tuple)):
+                            new_target_arr = np.array([float(new_target_pos[0]), 0.0, float(new_target_pos[2] if len(new_target_pos) > 2 else new_target_pos[1])])
+                        elif isinstance(new_target_pos, np.ndarray):
+                            new_target_arr = np.array([float(new_target_pos[0]), 0.0, float(new_target_pos[2] if len(new_target_pos) > 2 else new_target_pos[1])])
+                        else:
+                            new_target_arr = None
+                        
+                        # 버퍼에 있는 move_to_position의 target_position과 비교
+                        if has_move_to_position or current_action_ongoing:
+                            for buf_action in self.action_buffer[replicant_id]:
+                                if buf_action.get('type') == 'move_to_position':
+                                    existing_target = buf_action.get('target_position')
+                                    if existing_target is not None and new_target_arr is not None:
+                                        # 거의 같은 위치면 무시 (0.1m 이내)
+                                        if np.linalg.norm(existing_target - new_target_arr) < 0.1:
+                                            if hasattr(self, 'logger') and self.logger:
+                                                self.logger.debug(
+                                                    "[TDW] continuous_move: ignoring duplicate move_to_position (already moving to similar position: %s)",
+                                                    new_target_arr,
+                                                )
+                                            continue
+                    except Exception:
+                        pass
+                
+                # move_to_position이 진행 중이면 새 액션 무시
+                if has_move_to_position or current_action_ongoing:
+                    if hasattr(self, 'logger') and self.logger:
+                        self.logger.debug(
+                            "[TDW] continuous_move: ignoring new move_to_position (previous one still ongoing: buffer_len=%d, status=%s)",
+                            len(self.action_buffer[replicant_id]),
+                            self.controller.replicants[replicant_id].action.status,
+                        )
+                    continue  # 새 액션 무시, 이전 액션 계속 진행
+            
             # otherwise we start an action directly
             self.action_buffer[replicant_id] = []
             if "arm" in action:
@@ -673,22 +727,68 @@ class TDW(Env):
                 self.action_buffer[replicant_id].append({**copy.deepcopy(action), 'type': 'drop'})
             elif action["type"] == 6:      # send message
                 self.action_buffer[replicant_id].append({**copy.deepcopy(action), 'type': 'send_message'})
+            elif action["type"] == 8:      # delay/wait action
+                # Delay action: wait for specified number of frames
+                delay_frames = action.get("delay", 1)
+                # Set delay_frame_count for this agent
+                delay_frame_count[replicant_id] = delay_frames
+                # Don't add anything to action_buffer - agent will wait
+            elif action["type"] == 9:      # continuous movement to position (ViCo-Lite)
+                # Continuous movement: move directly to target position using TDW's move_to_position
+                target_pos = action.get("target_position")
+                if target_pos is not None:
+                    try:
+                        # Convert to numpy array format expected by move_to_position
+                        if isinstance(target_pos, (list, tuple)):
+                            target_pos_arr = np.array([float(target_pos[0]), 0.0, float(target_pos[2] if len(target_pos) > 2 else target_pos[1])])
+                        elif isinstance(target_pos, np.ndarray):
+                            target_pos_arr = np.array([float(target_pos[0]), 0.0, float(target_pos[2] if len(target_pos) > 2 else target_pos[1])])
+                        else:
+                            if hasattr(self, 'logger') and self.logger:
+                                self.logger.warning(
+                                    "[TDW] continuous_move: invalid target_position type: %s",
+                                    type(target_pos),
+                                )
+                            continue
+                        # Use TDW's move_to_position for continuous movement
+                        # This will be executed in the action loop below
+                        self.action_buffer[replicant_id].append({
+                            'type': 'move_to_position',
+                            'target_position': target_pos_arr
+                        })
+                    except Exception as exc:
+                        if hasattr(self, 'logger') and self.logger:
+                            self.logger.warning(
+                                "[TDW] continuous_move failed: %s, target_pos=%s",
+                                exc,
+                                target_pos,
+                            )
+                        # Skip this action if conversion fails
+                        continue
+                else:
+                    if hasattr(self, 'logger') and self.logger:
+                        self.logger.warning(
+                            "[TDW] continuous_move: missing target_position in action"
+                        )
             else:
-                assert False, "Invalid action type"
+                assert False, f"Invalid action type: {action.get('type')}"
 
         # Do action here
         valid = [True for _ in range(self.number_of_agents)]
-        delay_frame_count = [0 for _ in range(self.number_of_agents)]
         finish = False
         num_frames = 0
-        while not finish: # continue until any agent's action finishes
+        while not finish: # continue until all agents' actions finish
+            all_finished = True
             for replicant_id in self.controller.replicants:
                 if delay_frame_count[replicant_id] > 0:
                     delay_frame_count[replicant_id] -= 1
+                    all_finished = False
                     continue
                 if self.controller.replicants[replicant_id].action.status != ActionStatus.ongoing and len(self.action_buffer[replicant_id]) == 0:
-                    finish = True
+                    # This agent is finished, but check all agents
+                    pass
                 elif self.controller.replicants[replicant_id].action.status != ActionStatus.ongoing:
+                    all_finished = False
                     curr_action = self.action_buffer[replicant_id].pop(0)
                     if curr_action['type'] == 'move_forward':       # move forward 0.5m
                         self.controller.replicants[replicant_id].move_forward()
@@ -696,6 +796,26 @@ class TDW(Env):
                         self.controller.replicants[replicant_id].turn_by(angle = -15)
                     elif curr_action['type'] == 'turn_right':     # turn right by 15 degree
                         self.controller.replicants[replicant_id].turn_by(angle = 15)
+                    elif curr_action['type'] == 'move_to_position':  # continuous movement (ViCo-Lite)
+                        # Continuous movement to target position
+                        target_pos_arr = curr_action.get("target_position")
+                        if target_pos_arr is not None:
+                            try:
+                                self.controller.replicants[replicant_id].move_to_position(target_pos_arr)
+                            except Exception as exc:
+                                if hasattr(self, 'logger') and self.logger:
+                                    self.logger.warning(
+                                        "[TDW] move_to_position failed: %s, target_pos=%s",
+                                        exc,
+                                        target_pos_arr,
+                                    )
+                                valid[replicant_id] = False
+                        else:
+                            if hasattr(self, 'logger') and self.logger:
+                                self.logger.warning(
+                                    "[TDW] move_to_position: missing target_position"
+                                )
+                            valid[replicant_id] = False
                     elif curr_action['type'] == 'reach_for':     # go to and grasp object with arm
                         obj_id = int(curr_action["object"])
                         # Check if object_id exists in object_manager.transforms to prevent KeyError
@@ -728,19 +848,45 @@ class TDW(Env):
                         else:
                             self.controller.replicants[replicant_id].grasp(obj_id, curr_action["arm"], relative_to_hand = False, axis = "yaw")
                     elif curr_action["type"] == 'put_in':      # put in container
+                        # Store held objects BEFORE put_in (they will be None after successful put_in)
+                        # Use Arm.left and Arm.right explicitly to ensure correct order
+                        held_objects_before = [
+                            self.controller.state.replicants[replicant_id].get(Arm.left),
+                            self.controller.state.replicants[replicant_id].get(Arm.right)
+                        ]
+                        if self.logger:
+                            self.logger.debug(
+                                "[TDW] put_in: held_objects_before=[left=%s, right=%s], goal_position_id=%s, target_object_ids=%s",
+                                held_objects_before[0],
+                                held_objects_before[1],
+                                self.goal_position_id,
+                                self.target_object_ids if hasattr(self, 'target_object_ids') else None,
+                            )
+                        # Check if agent is actually holding any objects before executing put_in
+                        if held_objects_before[0] is None and held_objects_before[1] is None:
+                            if self.logger:
+                                self.logger.warning(
+                                    "[TDW] put_in: agent is not holding any objects, skipping put_in action (replicant_id=%d)",
+                                    replicant_id,
+                                )
+                            # Skip put_in action if agent is not holding anything
+                            continue
                         self.controller.replicants[replicant_id].put_in()
-                        held_objects = list(self.controller.state.replicants[replicant_id].values())
+                        held_objects = [
+                            self.controller.state.replicants[replicant_id].get(Arm.left),
+                            self.controller.state.replicants[replicant_id].get(Arm.right)
+                        ]
                         # Check if we have objects in both hands (standard put_in case)
-                        if held_objects[0] is not None and held_objects[1] is not None:
+                        if held_objects_before[0] is not None and held_objects_before[1] is not None:
                             container, target = None, None
-                            if self.get_object_type(held_objects[0]) == 1:
-                                container = held_objects[0]
+                            if self.get_object_type(held_objects_before[0]) == 1:
+                                container = held_objects_before[0]
                             else:
-                                target = held_objects[0]
-                            if self.get_object_type(held_objects[1]) == 1:
-                                container = held_objects[1]
+                                target = held_objects_before[0]
+                            if self.get_object_type(held_objects_before[1]) == 1:
+                                container = held_objects_before[1]
                             else:
-                                target = held_objects[1]
+                                target = held_objects_before[1]
                             if container is not None and target is not None:
                                 if container in self.containment_all:
                                     if target not in self.containment_all[container]:
@@ -748,9 +894,16 @@ class TDW(Env):
                                 else:
                                     self.containment_all[container] = [target]
                         # Handle case where agent holds only one object and target is goal_position_id (type 2)
-                        elif (held_objects[0] is not None or held_objects[1] is not None) and self.goal_position_id is not None:
-                            # Get the held object
-                            held_obj = held_objects[0] if held_objects[0] is not None else held_objects[1]
+                        # Check BEFORE put_in to get the held object, but verify AFTER put_in that we're near goal
+                        elif (held_objects_before[0] is not None or held_objects_before[1] is not None) and self.goal_position_id is not None:
+                            # Get the held object from BEFORE put_in
+                            held_obj = held_objects_before[0] if held_objects_before[0] is not None else held_objects_before[1]
+                            if self.logger:
+                                self.logger.debug(
+                                    "[TDW] put_in: held_obj=%s, in target_object_ids=%s",
+                                    held_obj,
+                                    held_obj in self.target_object_ids if hasattr(self, 'target_object_ids') and self.target_object_ids else False,
+                                )
                             if held_obj is not None and held_obj in self.target_object_ids:
                                 # Check if goal_position_id exists in object_manager.transforms
                                 if self.goal_position_id not in self.object_manager.transforms:
@@ -760,10 +913,17 @@ class TDW(Env):
                                             self.goal_position_id,
                                         )
                                 else:
-                                    # Check if agent is near goal_position_id (within 3m)
+                                    # Check if agent is near goal_position_id (within 3m) AFTER put_in
                                     agent_pos = self.controller.replicants[replicant_id].dynamic.transform.position
                                     goal_pos = self.object_manager.transforms[self.goal_position_id].position
                                     distance = self.get_2d_distance(agent_pos, goal_pos)
+                                    if self.logger:
+                                        self.logger.debug(
+                                            "[TDW] put_in: agent_pos=%s, goal_pos=%s, distance=%.2f",
+                                            agent_pos,
+                                            goal_pos,
+                                            distance,
+                                        )
                                     if distance < 3.0:
                                         # Successfully delivered to goal position
                                         # Mark as satisfied in check_goal
@@ -785,11 +945,32 @@ class TDW(Env):
                                                 self.goal_position_id,
                                                 distance,
                                             )
+                            else:
+                                if self.logger:
+                                    self.logger.debug(
+                                        "[TDW] put_in: held_obj=%s not in target_object_ids=%s, skipping goal_position check",
+                                        held_obj,
+                                        self.target_object_ids if hasattr(self, 'target_object_ids') else None,
+                                    )
+                        else:
+                            if self.logger:
+                                self.logger.debug(
+                                    "[TDW] put_in: condition not met - held_objects_before[0]=%s, held_objects_before[1]=%s, goal_position_id=%s",
+                                    held_objects_before[0],
+                                    held_objects_before[1],
+                                    self.goal_position_id,
+                                )
                     elif curr_action["type"] == 'drop':      # drop held object in arm
                         self.controller.replicants[replicant_id].drop(curr_action['arm'], max_num_frames = 30)
                     elif curr_action["type"] == 'send_message':      # send message
                         self.messages[replicant_id] = copy.deepcopy(curr_action['message'])
                         delay_frame_count[replicant_id] = max((len(self.messages[replicant_id]) - 1) // self.message_per_frame, 0)
+                else:
+                    # Action is ongoing, so not all finished
+                    all_finished = False
+            # Check if all agents are finished
+            if all_finished:
+                finish = True
             if finish: break
             data = self.controller.communicate([])
             for i in range(len(data) - 1):
