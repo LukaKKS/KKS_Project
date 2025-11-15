@@ -179,15 +179,57 @@ class ViCoPolicy:
                     # Confirmed: object is actually in held_objects
                     if self.logger:
                         self.logger.info("[Policy] pick success CONFIRMED id=%s frame=%s (in held_objects)", pick_id, frame)
+                    # Add successfully picked object to holding_ids immediately
+                    if pick_id is not None:
+                        current_holding_ids = self.agent_state.get("holding_ids", [])
+                        if pick_id not in current_holding_ids:
+                            current_holding_ids.append(pick_id)
+                            self.agent_state["holding_ids"] = current_holding_ids
+                            # Reset preserve frame since we just confirmed a pick
+                            self.agent_state["holding_ids_preserve_frame"] = frame
+                            if self.logger:
+                                self.logger.info(
+                                    "[Policy] pick success: added to holding_ids id=%s holding_ids=%s",
+                                    pick_id,
+                                    current_holding_ids,
+                                )
+                        # Get object name from visible_objects or object_info
+                        obj_name = None
+                        if self.agent_memory is not None and hasattr(self.agent_memory, "object_info"):
+                            obj_info = self.agent_memory.object_info.get(pick_id)
+                            if obj_info:
+                                obj_name = obj_info.get("name")
+                        if obj_name:
+                            self._register_skip_target(name=obj_name)
+                    # Clear last_command since pick is confirmed successful
+                    self.agent_state.pop("last_command", None)
+                    self.agent_state.pop("last_pick_id", None)
+                    self.agent_state.pop("last_pick_pos", None)
                 elif held_objects_empty:
-                    # held_objects is empty - might be delayed update, but also might be false positive
-                    # Log as potential success but mark for verification
+                    # held_objects is empty - status==1 might mean reach_for succeeded but grasp failed
+                    # Don't treat as success yet, wait for verification
                     if self.logger:
                         self.logger.warning(
-                            "[Policy] pick status=1 but held_objects empty id=%s frame=%s (will verify - might be false positive)",
+                            "[Policy] pick status=1 but held_objects empty id=%s frame=%s (reach_for may have succeeded but grasp failed - waiting for verification)",
                             pick_id,
                             frame,
                         )
+                    # Mark for verification but DON'T add to holding_ids yet
+                    # If verification succeeds (object appears in held_objects within 5 frames), then add to holding_ids
+                    if pick_id is not None:
+                        pending_verification = self.agent_state.get("pending_pick_verification", {})
+                        pending_verification[pick_id] = frame
+                        self.agent_state["pending_pick_verification"] = pending_verification
+                        if self.logger:
+                            self.logger.info(
+                                "[Policy] pick pending verification: id=%s (will check held_objects in next frames)",
+                                pick_id,
+                            )
+                    # CRITICAL: Clear last_command to prevent re-processing the same pick in next frame
+                    # The pick action is done (status=1), we're just waiting for verification
+                    # If we don't clear last_command, the same pick will be processed again in next frame
+                    self.agent_state.pop("last_command", None)
+                    # Keep last_pick_id for verification, but clear it after verification completes
                 else:
                     # held_objects has other objects but not the one we tried to pick - definitely failed
                     if self.logger:
@@ -212,39 +254,6 @@ class ViCoPolicy:
                     self.agent_state.pop("last_pick_pos", None)
                     # Continue to next part of act() - don't process as success
                     # (fall through to _update_agent_state)
-                
-                # Only process as success if actually held OR if held_objects is empty (delayed update case)
-                if is_actually_held or held_objects_empty:
-                    if self.logger and not is_actually_held:
-                        self.logger.info("[Policy] pick success id=%s frame=%s (held_objects empty, will verify)", pick_id, frame)
-                    # Add successfully picked object to holding_ids immediately
-                    # This is necessary because held_objects may not be updated in the same frame
-                    # But also mark it for verification in the next few frames
-                    if pick_id is not None:
-                        current_holding_ids = self.agent_state.get("holding_ids", [])
-                        if pick_id not in current_holding_ids:
-                            current_holding_ids.append(pick_id)
-                            self.agent_state["holding_ids"] = current_holding_ids
-                            # Reset preserve frame since we just confirmed a pick
-                            self.agent_state["holding_ids_preserve_frame"] = frame
-                            # Mark for verification: check if held_objects actually contains this object within 5 frames
-                            pending_verification = self.agent_state.get("pending_pick_verification", {})
-                            pending_verification[pick_id] = frame
-                            self.agent_state["pending_pick_verification"] = pending_verification
-                            if self.logger:
-                                self.logger.info(
-                                    "[Policy] pick success: added to holding_ids id=%s holding_ids=%s (will verify in held_objects)",
-                                    pick_id,
-                                    current_holding_ids,
-                                )
-                        # Get object name from visible_objects or object_info
-                        obj_name = None
-                        if self.agent_memory is not None and hasattr(self.agent_memory, "object_info"):
-                            obj_info = self.agent_memory.object_info.get(pick_id)
-                            if obj_info:
-                                obj_name = obj_info.get("name")
-                        if obj_name:
-                            self._register_skip_target(name=obj_name)
             elif prev_status == 2:
                 if self.logger:
                     self.logger.warning("[Policy] pick failed id=%s frame=%s", pick_id, frame)
@@ -1321,36 +1330,69 @@ class ViCoPolicy:
         # Verify pending picks: if pick was successful but held_objects doesn't contain it after 5 frames, remove it
         current_frame = obs.get("current_frames", 0)
         pending_verification = self.agent_state.get("pending_pick_verification", {})
+        if pending_verification and self.logger:
+            self.logger.debug(
+                "[Policy] _update_agent_state: checking pending_verification=%s (current_frame=%d)",
+                pending_verification,
+                current_frame,
+            )
         verified_picks = []
         verification_removed_ids = []  # Track IDs removed by verification
         for pick_id, pick_frame in pending_verification.items():
             frames_since_pick = current_frame - pick_frame
             if pick_id in actual_held_ids:
                 # Successfully verified - object is actually in held_objects
+                # Now add it to holding_ids if it's not already there
+                if pick_id not in holding_ids:
+                    holding_ids.append(pick_id)
+                    self.agent_state["holding_ids_preserve_frame"] = current_frame
+                    if self.logger:
+                        self.logger.info(
+                            "[Policy] pick verification SUCCESS: id=%s confirmed in held_objects, added to holding_ids (frame=%d, frames_since_pick=%d)",
+                            pick_id,
+                            current_frame,
+                            frames_since_pick,
+                        )
+                else:
+                    if self.logger:
+                        self.logger.debug(
+                            "[Policy] pick verification: id=%s confirmed in held_objects (frame=%d, frames_since_pick=%d)",
+                            pick_id,
+                            current_frame,
+                            frames_since_pick,
+                        )
                 verified_picks.append(pick_id)
                 # Remove from verification_removed_ids if it was there (shouldn't happen, but just in case)
                 verification_removed_set = self.agent_state.get("verification_removed_ids", set())
                 if pick_id in verification_removed_set:
                     verification_removed_set.discard(pick_id)
                     self.agent_state["verification_removed_ids"] = verification_removed_set
-                if self.logger:
-                    self.logger.debug(
-                        "[Policy] pick verification: id=%s confirmed in held_objects (frame=%d, frames_since_pick=%d)",
-                        pick_id,
-                        current_frame,
-                        frames_since_pick,
-                    )
             elif frames_since_pick >= 5:
-                # 5 frames passed but object is not in held_objects - likely false positive
+                # 5 frames passed but object is not in held_objects - likely false positive (reach_for succeeded but grasp failed)
                 if pick_id in holding_ids:
                     holding_ids.remove(pick_id)
                     verification_removed_ids.append(pick_id)
                 if self.logger:
                     self.logger.warning(
-                        "[Policy] pick verification failed: id=%s not in held_objects after %d frames, removing from holding_ids",
+                        "[Policy] pick verification FAILED: id=%s not in held_objects after %d frames (reach_for succeeded but grasp likely failed) - clearing pick state to allow retry",
                         pick_id,
                         frames_since_pick,
                     )
+                # Clear pick state to allow retry with different approach
+                # If this is the current pick, clear last_command and last_pick_id
+                current_last_pick_id = self.agent_state.get("last_pick_id")
+                if current_last_pick_id == pick_id:
+                    self.agent_state.pop("last_command", None)
+                    self.agent_state.pop("last_pick_id", None)
+                    self.agent_state.pop("last_pick_pos", None)
+                    if self.logger:
+                        self.logger.info(
+                            "[Policy] cleared last_command and last_pick_id for failed pick id=%s to allow retry",
+                            pick_id,
+                        )
+                # Store the failed pick info for potential retry
+                self.agent_state["last_failed_pick_id"] = pick_id
+                self.agent_state["last_failed_pick_frame"] = current_frame
                 verified_picks.append(pick_id)
         # Remove verified picks from pending
         for pick_id in verified_picks:
@@ -1371,19 +1413,55 @@ class ViCoPolicy:
             verification_removed_set.update(verification_removed_ids)
             self.agent_state["verification_removed_ids"] = verification_removed_set
         
-        # Check if put_in was successful (status == 1 and last_command was deliver)
+        # Check if put_in was successful
+        # Method 1: status == 1 and last_command was deliver
+        # Method 2: last_command was deliver and held_objects is empty (object was actually delivered)
+        # Method 3: last_command was deliver and previous holding_ids objects are no longer in held_objects
         prev_status = obs.get("status")
         last_command = self.agent_state.get("last_command")
-        if isinstance(prev_status, int) and last_command == "deliver" and prev_status == 1:
-            # put_in was successful, clear holding_ids
-            if self.logger:
-                self.logger.info(
-                    "[Policy] deliver success: clearing holding_ids (was %s)",
-                    self.agent_state.get("holding_ids", []),
-                )
-            holding_ids = []
+        previous_holding_ids = self.agent_state.get("holding_ids", [])
+        put_in_success = False
+        
+        if last_command == "deliver":
+            # Check if put_in was successful by comparing held_objects
+            # If previous holding_ids objects are no longer in held_objects, put_in was successful
+            if previous_holding_ids:
+                # Check if any previous holding_ids objects are still in held_objects
+                still_holding = [hid for hid in previous_holding_ids if hid in actual_held_ids]
+                if not still_holding:
+                    # All previous holding_ids objects are no longer in held_objects - put_in was successful
+                    put_in_success = True
+                    if self.logger:
+                        self.logger.info(
+                            "[Policy] deliver success: all previous holding_ids objects no longer in held_objects (was %s, now %s)",
+                            previous_holding_ids,
+                            actual_held_ids,
+                        )
+                elif isinstance(prev_status, int) and prev_status == 1:
+                    # status == 1 also indicates success
+                    put_in_success = True
+                    if self.logger:
+                        self.logger.info(
+                            "[Policy] deliver success: status=1 and last_command=deliver (was %s, now %s)",
+                            previous_holding_ids,
+                            actual_held_ids,
+                        )
+            elif isinstance(prev_status, int) and prev_status == 1:
+                # status == 1 indicates success even if no previous holding_ids
+                put_in_success = True
+                if self.logger:
+                    self.logger.info(
+                        "[Policy] deliver success: status=1 and last_command=deliver (no previous holding_ids)",
+                    )
+        
+        if put_in_success:
+            # put_in was successful, clear holding_ids (use actual_held_ids instead of empty list)
+            # This ensures we only keep objects that are actually still being held
+            holding_ids = actual_held_ids.copy()  # Only keep objects that are actually still in held_objects
             holding_slots = {}
-            valid_held_objects = False  # Don't preserve existing holding_ids
+            valid_held_objects = len(actual_held_ids) > 0  # Set to True if there are still held objects
+            # Clear last_command to prevent repeating the same deliver action
+            self.agent_state.pop("last_command", None)
         
         # If held_objects is empty or all None, preserve existing holding_ids
         # This is important because pick success may have just added an object,
@@ -1392,7 +1470,7 @@ class ViCoPolicy:
         # Also limit preservation time to max 10 frames to avoid stale state
         # Also don't preserve IDs that were removed by verification
         current_frame = obs.get("current_frames", 0)
-        if not valid_held_objects and not (isinstance(prev_status, int) and last_command == "deliver" and prev_status == 1):
+        if not valid_held_objects and not put_in_success:
             existing_holding_ids = self.agent_state.get("holding_ids", [])
             preserve_frame = self.agent_state.get("holding_ids_preserve_frame", -1)
             max_preserve_frames = 10  # Maximum frames to preserve holding_ids without confirmation

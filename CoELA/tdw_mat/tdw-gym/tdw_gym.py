@@ -450,16 +450,22 @@ class TDW(Env):
         place_pos = self.object_manager.transforms[self.goal_position_id].position
         count = 0
         for object_id in self.target_object_ids:
+            # If object is already satisfied, count it even if it's not in transforms anymore
+            # (objects may be removed from transforms after being delivered)
+            if object_id in self.satisfied.keys():
+                count += 1
+                continue
+            
             # Check if object_id exists in object_manager.transforms to prevent KeyError
             if object_id not in self.object_manager.transforms:
                 if hasattr(self, 'logger') and self.logger:
                     self.logger.debug(
-                        "[TDW] check_goal: object_id=%d not in object_manager.transforms, skipping",
+                        "[TDW] check_goal: object_id=%d not in object_manager.transforms, skipping (not satisfied yet)",
                         object_id,
                     )
                 continue
             pos = self.object_manager.transforms[object_id].position
-            if (self.get_2d_distance(pos, place_pos) < 3 and self.belongs_to_which_room(pos) is not None and 'Bedroom' in self.belongs_to_which_room(pos)) or object_id in self.satisfied.keys():
+            if self.get_2d_distance(pos, place_pos) < 3 and self.belongs_to_which_room(pos) is not None and 'Bedroom' in self.belongs_to_which_room(pos):
                 count += 1
                 self.satisfied[object_id] = True
         return count, len(self.target_object_ids), count == len(self.target_object_ids)
@@ -719,8 +725,10 @@ class TDW(Env):
             elif action["type"] == 2:     # turn right by 15 degree
                 self.action_buffer[replicant_id].append({**copy.deepcopy(action), 'type': 'turn_right'})
             elif action["type"] == 3:     # go to and grasp object with arm
-                self.action_buffer[replicant_id].append({**copy.deepcopy(action), 'type': 'reach_for'})
-                self.action_buffer[replicant_id].append({**copy.deepcopy(action), 'type': 'grasp'})
+                # Use pick_up directly instead of reach_for + grasp
+                # pick_up handles TurnTo + ReachFor + Grasp + ResetArms automatically
+                # It works with object_id only, no need for object_manager.transforms
+                self.action_buffer[replicant_id].append({**copy.deepcopy(action), 'type': 'pick_up'})
             elif action["type"] == 4:      # put in container
                 self.action_buffer[replicant_id].append({**copy.deepcopy(action), 'type': 'put_in'})
             elif action["type"] == 5:      # drop held object in arm
@@ -834,6 +842,61 @@ class TDW(Env):
                                 self.action_buffer[replicant_id] = [] # the action is invaild
                             else: 
                                 self.controller.replicants[replicant_id].move_to_position(self.object_manager.transforms[obj_id].position)
+                    elif curr_action['type'] == 'pick_up':
+                        # Use move_to_object + pick_up sequence
+                        # move_to_object handles navigation automatically, then pick_up when close enough
+                        # Works with object_id only, no need for object_manager.transforms or position
+                        obj_id = int(curr_action["object"])
+                        try:
+                            # First, move to the object (this handles navigation automatically)
+                            # move_to_object uses object_id only and navigates until arrived_at=0.7
+                            self.controller.replicants[replicant_id].move_to_object(target=obj_id)
+                            if hasattr(self, 'logger') and self.logger:
+                                self.logger.debug(
+                                    "[TDW] pick_up: move_to_object called for object_id=%d (replicant_id=%d)",
+                                    obj_id,
+                                    replicant_id,
+                                )
+                            # After move_to_object completes, we'll need to call pick_up in a subsequent frame
+                            # Store the object_id for the next step
+                            self.action_buffer[replicant_id].append({**copy.deepcopy(curr_action), 'type': 'pick_up_after_move'})
+                        except Exception as e:
+                            if hasattr(self, 'logger') and self.logger:
+                                self.logger.warning(
+                                    "[TDW] pick_up (move_to_object) failed: object_id=%d, error=%s",
+                                    obj_id,
+                                    e,
+                                )
+                            valid[replicant_id] = False
+                            self.action_buffer[replicant_id] = []  # the action is invalid
+                    elif curr_action['type'] == 'pick_up_after_move':
+                        # This is called after move_to_object completes
+                        # Check if move_to_object is still ongoing
+                        if self.controller.replicants[replicant_id].action.status == ActionStatus.ongoing:
+                            # move_to_object is still in progress, wait for it to complete
+                            # Put the action back in the buffer
+                            self.action_buffer[replicant_id].insert(0, curr_action)
+                            continue
+                        # move_to_object has completed, now call pick_up
+                        obj_id = int(curr_action["object"])
+                        try:
+                            # pick_up automatically selects arm (right hand preferred, left if right is occupied)
+                            self.controller.replicants[replicant_id].pick_up(target=obj_id)
+                            if hasattr(self, 'logger') and self.logger:
+                                self.logger.debug(
+                                    "[TDW] pick_up: called for object_id=%d after move_to_object completed (replicant_id=%d)",
+                                    obj_id,
+                                    replicant_id,
+                                )
+                        except Exception as e:
+                            if hasattr(self, 'logger') and self.logger:
+                                self.logger.warning(
+                                    "[TDW] pick_up failed: object_id=%d, error=%s",
+                                    obj_id,
+                                    e,
+                                )
+                            valid[replicant_id] = False
+                            self.action_buffer[replicant_id] = []  # the action is invalid
                     elif curr_action['type'] == 'grasp':
                         obj_id = int(curr_action["object"])
                         # Check if object_id exists in object_manager.transforms to prevent KeyError
