@@ -912,16 +912,27 @@ class ViCoPolicy:
                     plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "llm_invalid_z_zero_position"})
                     rejected = True
                 elif not self.env_api["check_pos_in_room"]((target_pos[0], target_pos[2])):
-                    # For pick actions, don't clamp - use actual object position
+                    # For pick actions, if position is outside room, set target_pos to None and use object_id only
                     # For other actions, try to use executor's clamp_target to find a valid position
                     if plan.action_type == "pick":
-                        # Pick actions need the actual object position, don't clamp
+                        # Pick actions: if position is outside room, remove it and use object_id only
                         if self.logger:
                             self.logger.warning(
-                                "[Policy] pick target outside room but not clamping (using actual object position): %s",
+                                "[Policy] pick target outside room, removing position and using object_id only: %s (id=%s)",
                                 target_pos,
+                                plan.target_id,
                             )
-                        # Don't reject pick actions with positions outside room - executor will handle navigation
+                        # Remove target_position - executor will use object_id only for navigation
+                        meta = dict(plan.meta)
+                        meta["target_position"] = None
+                        plan = ReasonedPlan(
+                            plan.action_type,
+                            plan.target_id,
+                            None,  # Set target_position to None
+                            plan.confidence,
+                            meta,
+                        )
+                        # Don't reject - executor will handle navigation using object_id
                         pass
                     else:
                         clamped_pos = self.executor._clamp_target(target_pos)
@@ -2101,15 +2112,37 @@ class ViCoPolicy:
                                     estimated_x = float(agent_pos[0]) + float(distance) * forward_arr[0]
                                     estimated_z = float(agent_pos[2]) + float(distance) * forward_arr[2]
                                     estimated_y = float(agent_pos[1])  # Keep same height
-                                    target_pos = (estimated_x, estimated_y, estimated_z)
-                                    if self.logger:
-                                        self.logger.info(
-                                            "[Policy] _maybe_force_pick: estimated position for task target id=%s name=%s dist=%.2f pos=%s",
-                                            target_id,
-                                            best_info.get("name"),
-                                            distance,
-                                            target_pos,
-                                        )
+                                    estimated_pos = (estimated_x, estimated_y, estimated_z)
+                                    
+                                    # Check if estimated position is in room - if not, don't use it (will use object_id only)
+                                    is_in_room = True
+                                    if self.env_api and "check_pos_in_room" in self.env_api:
+                                        try:
+                                            is_in_room = self.env_api["check_pos_in_room"]((estimated_x, estimated_z))
+                                        except Exception:
+                                            is_in_room = False
+                                    
+                                    if is_in_room:
+                                        target_pos = estimated_pos
+                                        if self.logger:
+                                            self.logger.info(
+                                                "[Policy] _maybe_force_pick: estimated position for task target id=%s name=%s dist=%.2f pos=%s",
+                                                target_id,
+                                                best_info.get("name"),
+                                                distance,
+                                                target_pos,
+                                            )
+                                    else:
+                                        # Estimated position is outside room - don't use it, will use object_id only
+                                        if self.logger:
+                                            self.logger.warning(
+                                                "[Policy] _maybe_force_pick: estimated position outside room, using object_id only (id=%s name=%s dist=%.2f pos=%s)",
+                                                target_id,
+                                                best_info.get("name"),
+                                                distance,
+                                                estimated_pos,
+                                            )
+                                        target_pos = None  # Will use object_id only in executor
                     except Exception as exc:
                         if self.logger:
                             self.logger.debug(
@@ -2119,22 +2152,32 @@ class ViCoPolicy:
                                 exc,
                             )
                 
-                # If position is still None but distance is close enough, allow pick without position
-                # Executor will handle this case
+                # If position is still None, allow pick without position for task targets (any distance) or close objects
+                # Executor will handle this case using reach_for (type 3) for task targets
                 if target_pos is None:
-                    if distance <= 2.5:  # Allow pick if distance is close enough
+                    # Task targets: allow any distance (executor will use reach_for with object_id)
+                    # Non-task targets: only allow if distance <= 2.5m
+                    if is_task_target or distance <= 2.5:
                         if self.logger:
-                            self.logger.info(
-                                "[Policy] _maybe_force_pick: allowing pick without position (id=%s name=%s dist=%.2f)",
-                                target_id,
-                                best_info.get("name"),
-                                distance,
-                            )
+                            if is_task_target:
+                                self.logger.info(
+                                    "[Policy] _maybe_force_pick: allowing task target pick without position (id=%s name=%s dist=%.2f, will use reach_for)",
+                                    target_id,
+                                    best_info.get("name"),
+                                    distance,
+                                )
+                            else:
+                                self.logger.info(
+                                    "[Policy] _maybe_force_pick: allowing pick without position (id=%s name=%s dist=%.2f)",
+                                    target_id,
+                                    best_info.get("name"),
+                                    distance,
+                                )
                         # Keep target_pos as None, executor will handle it
                     else:
                         if self.logger:
                             self.logger.debug(
-                                "[Policy] _maybe_force_pick: skipping without position (too far): id=%s name=%s distance=%.2f",
+                                "[Policy] _maybe_force_pick: skipping without position (too far, not task target): id=%s name=%s distance=%.2f",
                                 target_id,
                                 best_info.get("name"),
                                 distance,

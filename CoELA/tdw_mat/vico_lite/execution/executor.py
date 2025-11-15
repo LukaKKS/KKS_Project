@@ -309,16 +309,17 @@ class PlanExecutor:
                     meta["distance"] = force_pick_distance
                     meta["note"] = "pick_without_position"
                 elif is_task_target:
-                    # Task target but too far - try to navigate using object_id
-                    # TDW's move_to_position can work with object_id directly
+                    # Task target but too far - use reach_for (type 3) which automatically navigates to object_id
+                    # reach_for will handle navigation automatically when given object_id
                     if self.logger:
                         self.logger.info(
-                            "[Executor] pick: no position but task target distance=%.2f, will attempt pick with object_id only",
+                            "[Executor] pick: no position but task target distance=%.2f, using reach_for with object_id only",
                             force_pick_distance,
                         )
-                    meta["navigation"] = "pick_with_object_id"
+                    meta["navigation"] = "reach_for_with_object_id"
                     meta["distance"] = force_pick_distance
-                    meta["note"] = "no_position_using_object_id"
+                    meta["note"] = "no_position_using_object_id_reach_for"
+                    # Will use reach_for (type 3) below - skip to pick section
                 else:
                     # Not task target and too far
                     if self.logger:
@@ -373,8 +374,18 @@ class PlanExecutor:
                 if target_id_int not in self.agent_memory.object_info:
                     object_in_memory = False
                     is_task_target = plan.meta.get("is_task_target", False)
+                    # 핵심 수정: target_pos가 None이고 reach_for를 사용할 경우, object_id 체크를 건너뜀
+                    # reach_for (type 3)는 object_id만으로도 동작하므로 object_info에 없어도 사용 가능
+                    if target_pos is None and meta.get("note") == "no_position_using_object_id_reach_for":
+                        if self.logger:
+                            self.logger.info(
+                                "[Executor] object_id=%s not in agent_memory.object_info but will use reach_for (type 3), skipping object_info check",
+                                target_id_int,
+                            )
+                        # object_in_memory를 True로 설정하여 이후 로직에서 reach_for를 사용할 수 있도록 함
+                        object_in_memory = True
                     # Navigation이 이미 시작되었으면 navigation을 계속 진행
-                    if navigation_started and navigation_command is not None:
+                    elif navigation_started and navigation_command is not None:
                         if self.logger:
                             self.logger.info(
                                 "[Executor] object_id=%s not in agent_memory.object_info but navigation already started, continuing navigation (task_target=%s)",
@@ -437,6 +448,29 @@ class PlanExecutor:
         
         # 방안 4: Pick 거리 임계값 조정 - 2.0m에서 2.5m로 완화
         reach_threshold = 2.5  # 2.0에서 2.5로 증가
+        
+        # 핵심 수정: target_pos가 None이고 object_id만 있는 경우, reach_for (type 3)를 바로 사용
+        # reach_for는 자동으로 navigation을 수행하므로 거리 체크를 건너뜀
+        if target_pos is None and meta.get("note") == "no_position_using_object_id_reach_for":
+            # Use reach_for (type 3) which will automatically navigate to object_id
+            holding_slots = agent_state.get("holding_slots", {}) if isinstance(agent_state, dict) else {}
+            left_busy = holding_slots.get("left") is not None
+            right_busy = holding_slots.get("right") is not None
+            if left_busy and right_busy:
+                meta.update({"reason": "hands_full"})
+                return {"type": "ongoing"}, meta
+            arm = "right" if left_busy and not right_busy else "left"
+            command = {"type": 3, "object": target_id_int, "arm": arm}
+            meta.update({"result": "attempt_pick_with_reach_for", "arm": arm, "distance": force_pick_distance})
+            if self.logger:
+                self.logger.info(
+                    "[Executor] using reach_for (type 3) with object_id only: id=%s arm=%s dist=%.2f",
+                    target_id_int,
+                    arm,
+                    force_pick_distance,
+                )
+            return command, meta
+        
         if actual_distance > reach_threshold:
             if self.logger:
                 self.logger.debug(

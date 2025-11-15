@@ -1015,7 +1015,7 @@ class AgentMemory():
                 continue
             distance = len(path) * 2 + obstacle_distance
             l2_distance = self.l2_distance(self.position, (x, z))
-            print(l2_distance)
+            # print(l2_distance)  # Debug print removed
             if distance < curr_min_distance and l2_distance > SURROUNDING_DISTANCE:
                 curr_min_distance = distance
                 curr_x, curr_z = x, z
