@@ -478,17 +478,53 @@ class ViCoPolicy:
                         frame,
                         no_vision_count,
                     )
-                # Explore로 위치 변경
-                explore_plan = ReasonedPlan("search", None, None, 0.5, {"reason": "no_vision_for_too_long"})
+                # Explore로 위치 변경 - 더 적극적으로 다른 위치로 이동
+                # blocked_coords를 추가하여 같은 위치로 이동하지 않도록 함
+                blocked_coords = self.agent_state.get("blocked_coords", set())
+                current_pos = snapshot.get("agent_position")
+                if current_pos:
+                    blocked_coords.add(tuple(current_pos[:2]))  # (x, z) 좌표만 사용
+                    self.agent_state["blocked_coords"] = blocked_coords
+                
+                explore_plan = ReasonedPlan("search", None, None, 0.5, {"reason": "no_vision_for_too_long", "fallback": "persist"})
                 # _ensure_plan_target은 내부에서 blocked_coords를 계산함
                 explore_plan = self._ensure_plan_target(explore_plan)
+                
+                # If still idle, try to move to a random position far from current position
+                if explore_plan.action_type == "idle" and current_pos and no_vision_count >= 10:
+                    # Move to a position far from current position (e.g., opposite side of room)
+                    import random
+                    if hasattr(self, 'env_api') and self.env_api:
+                        room_bounds = self.env_api.get("room_bounds")
+                        if room_bounds:
+                            # Move to a random position in the room, far from current position
+                            target_x = random.uniform(room_bounds[0][0], room_bounds[1][0])
+                            target_z = random.uniform(room_bounds[0][2], room_bounds[1][2])
+                            target_pos = (target_x, current_pos[1], target_z)
+                            explore_plan = ReasonedPlan("move", None, target_pos, 0.5, {"reason": "no_vision_for_too_long", "fallback": "random_position"})
+                            if self.logger:
+                                self.logger.info(
+                                    "[Policy] frame=%s no vision for %d frames, moving to random position %s",
+                                    frame,
+                                    no_vision_count,
+                                    target_pos,
+                                )
+                
                 if explore_plan.action_type != "idle":
                     command, exec_meta = self.executor.execute(explore_plan, snapshot, self.agent_state)
                     self.agent_state.setdefault("recent_meta", []).append(exec_meta)
+                    # Reset no_vision_count after executing explore action
+                    self.agent_state["no_vision_count"] = 0
                     return command
         else:
             # Vision이 있으면 카운터 리셋
             self.agent_state["no_vision_count"] = 0
+            # Vision이 있으면 blocked_coords도 일부 클리어 (최근 것만 유지)
+            blocked_coords = self.agent_state.get("blocked_coords", set())
+            if len(blocked_coords) > 10:
+                # Keep only the 5 most recent blocked coordinates
+                blocked_coords = set(list(blocked_coords)[-5:])
+                self.agent_state["blocked_coords"] = blocked_coords
         
         self.agent_state["last_visible_infos"] = visible_infos
         if self.logger and getattr(self.logger, "debug", None):
@@ -1455,13 +1491,29 @@ class ViCoPolicy:
                     )
         
         if put_in_success:
-            # put_in was successful, clear holding_ids (use actual_held_ids instead of empty list)
-            # This ensures we only keep objects that are actually still being held
-            holding_ids = actual_held_ids.copy()  # Only keep objects that are actually still in held_objects
+            # put_in was successful, remove delivered objects from holding_ids
+            # Even if held_objects still contains them (TDW delay), status==1 means delivery succeeded
+            # Remove all previous_holding_ids objects from holding_ids
+            if previous_holding_ids:
+                # Keep only objects that are actually still in held_objects AND were not in previous_holding_ids
+                # This removes all delivered objects from holding_ids
+                holding_ids = [hid for hid in actual_held_ids if hid not in previous_holding_ids]
+                if self.logger:
+                    self.logger.info(
+                        "[Policy] deliver success: removed delivered objects from holding_ids (was %s, removed %s, now %s)",
+                        previous_holding_ids,
+                        previous_holding_ids,
+                        holding_ids,
+                    )
+            else:
+                # No previous holding_ids, just use actual_held_ids
+                holding_ids = actual_held_ids.copy()
             holding_slots = {}
-            valid_held_objects = len(actual_held_ids) > 0  # Set to True if there are still held objects
+            valid_held_objects = len(holding_ids) > 0  # Set to True if there are still held objects
             # Clear last_command to prevent repeating the same deliver action
             self.agent_state.pop("last_command", None)
+            self.agent_state.pop("last_deliver_id", None)
+            self.agent_state.pop("last_deliver_pos", None)
         
         # If held_objects is empty or all None, preserve existing holding_ids
         # This is important because pick success may have just added an object,
