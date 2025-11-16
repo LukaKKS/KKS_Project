@@ -12,6 +12,7 @@ from tdw.replicant.arm import Arm
 from tdw.tdw_utils import TDWUtils
 
 from transport_challenge_multi_agent.transport_challenge import TransportChallenge
+from transport_challenge_multi_agent.reach_for_transport_challenge import ReachForTransportChallenge
 from collections import Counter
 from tdw.replicant.action_status import ActionStatus
 from tdw.replicant.image_frequency import ImageFrequency
@@ -68,6 +69,7 @@ class TDW(Env):
         self.number_of_agents = number_of_agents
         self.seed = None
         self.num_step = 0
+        self.put_in_success = {}  # {replicant_id: [object_id, ...]} - objects successfully delivered in this step
         self.reward = 0
         self.done = False
         self.scene_info = None
@@ -131,6 +133,7 @@ class TDW(Env):
             'camera_matrix': gym.spaces.Box(-30, 30, (4, 4), dtype=np.float32),
             'messages': gym.spaces.Tuple(gym.spaces.Text(max_length=1000, charset=string.printable) for _ in range(2)),
             'current_frames': gym.spaces.Discrete(30),
+            'put_in_success': gym.spaces.Tuple(gym.spaces.Discrete(30) for _ in range(10)),  # List of object_ids that were successfully delivered (max 10)
         })
 
         self.observation_space = gym.spaces.Dict({
@@ -217,6 +220,7 @@ class TDW(Env):
         scene_info = options
         print(scene_info)
         self.satisfied = {}
+        self.put_in_success = {}  # Reset put_in_success tracking
         if output_dir is not None: self.save_dir = output_dir
         if scene_info is not None:
             scene = scene_info['scene']
@@ -760,9 +764,12 @@ class TDW(Env):
                             continue
                         # Use TDW's move_to_position for continuous movement
                         # This will be executed in the action loop below
+                        # Check if this is for a pick action (arrived_at should be smaller for pick)
+                        arrived_at = action.get("arrived_at", 0.7)  # Default 0.7m, but can be overridden for pick
                         self.action_buffer[replicant_id].append({
                             'type': 'move_to_position',
-                            'target_position': target_pos_arr
+                            'target_position': target_pos_arr,
+                            'arrived_at': arrived_at
                         })
                     except Exception as exc:
                         if hasattr(self, 'logger') and self.logger:
@@ -785,7 +792,28 @@ class TDW(Env):
         valid = [True for _ in range(self.number_of_agents)]
         finish = False
         num_frames = 0
+        max_frames_per_step = 500  # Safety limit: prevent infinite loops in step function
         while not finish: # continue until all agents' actions finish
+            # Safety check: prevent infinite loops
+            if num_frames >= max_frames_per_step:
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.warning(
+                        "[TDW] step: exceeded max_frames_per_step=%d, forcing finish to prevent infinite loop",
+                        max_frames_per_step,
+                    )
+                finish = True
+                break
+            # Check if total frames exceeded max_frame
+            if self.num_frames + num_frames >= self.max_frame:
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.warning(
+                        "[TDW] step: total frames (%d + %d) >= max_frame (%d), forcing finish",
+                        self.num_frames,
+                        num_frames,
+                        self.max_frame,
+                    )
+                finish = True
+                break
             all_finished = True
             for replicant_id in self.controller.replicants:
                 if delay_frame_count[replicant_id] > 0:
@@ -807,9 +835,10 @@ class TDW(Env):
                     elif curr_action['type'] == 'move_to_position':  # continuous movement (ViCo-Lite)
                         # Continuous movement to target position
                         target_pos_arr = curr_action.get("target_position")
+                        arrived_at = curr_action.get("arrived_at", 0.7)  # Default 0.7m, but can be smaller for pick (e.g., 0.3m)
                         if target_pos_arr is not None:
                             try:
-                                self.controller.replicants[replicant_id].move_to_position(target_pos_arr)
+                                self.controller.replicants[replicant_id].move_to_position(target_pos_arr, arrived_at=arrived_at)
                             except Exception as exc:
                                 if hasattr(self, 'logger') and self.logger:
                                     self.logger.warning(
@@ -860,6 +889,9 @@ class TDW(Env):
                             # After move_to_object completes, we'll need to call pick_up in a subsequent frame
                             # Store the object_id for the next step
                             self.action_buffer[replicant_id].append({**copy.deepcopy(curr_action), 'type': 'pick_up_after_move'})
+                            # Return ongoing to indicate that move_to_object is in progress
+                            # This prevents policy from generating new actions while navigation is ongoing
+                            valid[replicant_id] = True  # Action is valid, just ongoing
                         except Exception as e:
                             if hasattr(self, 'logger') and self.logger:
                                 self.logger.warning(
@@ -871,23 +903,234 @@ class TDW(Env):
                             self.action_buffer[replicant_id] = []  # the action is invalid
                     elif curr_action['type'] == 'pick_up_after_move':
                         # This is called after move_to_object completes
-                        # Check if move_to_object is still ongoing
-                        if self.controller.replicants[replicant_id].action.status == ActionStatus.ongoing:
+                        # Initialize closer_move_retry_count if not present
+                        if 'closer_move_retry_count' not in curr_action:
+                            curr_action['closer_move_retry_count'] = 0
+                        
+                        # Check if we're waiting for move_to_position to get closer
+                        if curr_action.get('waiting_for_closer_move', False):
+                            # Check if move_to_position is still ongoing
+                            if self.controller.replicants[replicant_id].action.status == ActionStatus.ongoing:
+                                # move_to_position is still in progress, wait for it to complete
+                                self.action_buffer[replicant_id].insert(0, curr_action)
+                                continue
+                            else:
+                                # move_to_position has completed, clear the flag and continue to check distance
+                                curr_action['waiting_for_closer_move'] = False
+                                # Increment retry count
+                                curr_action['closer_move_retry_count'] = curr_action.get('closer_move_retry_count', 0) + 1
+                                # Continue to check distance below
+                        # Check if move_to_object is still ongoing (initial navigation)
+                        elif self.controller.replicants[replicant_id].action.status == ActionStatus.ongoing:
                             # move_to_object is still in progress, wait for it to complete
                             # Put the action back in the buffer
                             self.action_buffer[replicant_id].insert(0, curr_action)
                             continue
-                        # move_to_object has completed, now call pick_up
+                        # Check if move_to_object failed
+                        elif self.controller.replicants[replicant_id].action.status != ActionStatus.success:
+                            # move_to_object failed, but try using reach_for as fallback
+                            # reach_for can work even when navigation fails (detected_obstacle, collision, etc.)
+                            obj_id = int(curr_action.get("object", -1))
+                            action_status = self.controller.replicants[replicant_id].action.status
+                            
+                            # Check if object_id exists in object_manager.transforms
+                            if obj_id in self.object_manager.transforms:
+                                # Try using reach_for (type 3) which can work even with obstacles
+                                try:
+                                    distance = self.get_2d_distance(
+                                        self.controller.replicants[replicant_id].dynamic.transform.position,
+                                        self.object_manager.transforms[obj_id].position
+                                    )
+                                    if distance <= self.reach_threshold:
+                                        # Close enough, try pick_up directly
+                                        self.controller.replicants[replicant_id].pick_up(target=obj_id)
+                                        if hasattr(self, 'logger') and self.logger:
+                                            self.logger.info(
+                                                "[TDW] pick_up_after_move: move_to_object failed (status=%s) but close enough (dist=%.2f), trying pick_up directly for object_id=%d",
+                                                action_status,
+                                                distance,
+                                                obj_id,
+                                            )
+                                    else:
+                                        # Try reach_for which can navigate around obstacles
+                                        # Check which arm is available
+                                        held_objects = self.controller.state.replicants[replicant_id].get(Arm.left)
+                                        right_held = self.controller.state.replicants[replicant_id].get(Arm.right)
+                                        # Use right arm if left is busy, otherwise use left
+                                        arm_to_use = Arm.right if held_objects is not None and right_held is None else Arm.left
+                                        # Use ReachForTransportChallenge directly
+                                        self.controller.replicants[replicant_id].action = ReachForTransportChallenge(
+                                            target=obj_id,
+                                            arm=arm_to_use,
+                                            absolute=True,
+                                            dynamic=self.controller.replicants[replicant_id].dynamic
+                                        )
+                                        if hasattr(self, 'logger') and self.logger:
+                                            self.logger.info(
+                                                "[TDW] pick_up_after_move: move_to_object failed (status=%s), trying reach_for for object_id=%d (dist=%.2f)",
+                                                action_status,
+                                                obj_id,
+                                                distance,
+                                            )
+                                    valid[replicant_id] = True
+                                except Exception as e:
+                                    if hasattr(self, 'logger') and self.logger:
+                                        self.logger.warning(
+                                            "[TDW] pick_up_after_move: move_to_object failed (status=%s) and fallback failed for object_id=%d: %s",
+                                            action_status,
+                                            obj_id,
+                                            e,
+                                        )
+                                    valid[replicant_id] = False
+                            else:
+                                # Object not in transforms, skip
+                                if hasattr(self, 'logger') and self.logger:
+                                    self.logger.warning(
+                                        "[TDW] pick_up_after_move: move_to_object failed (status=%s) and object_id=%d not in transforms, skipping pick_up",
+                                        action_status,
+                                        obj_id,
+                                    )
+                                valid[replicant_id] = False
+                            # Don't add back to buffer, move on to next action
+                            continue
+                        # move_to_object has completed, now check distance before calling pick_up
                         obj_id = int(curr_action["object"])
+                        
+                        # Check distance to object before attempting pick_up
+                        # If still too far, try to get closer
+                        distance_too_far = False
+                        actual_distance = None
+                        pick_distance_threshold = 0.2  # Need to be within 0.2m for reliable pick_up
+                        if obj_id in self.object_manager.transforms:
+                            try:
+                                agent_pos = self.controller.replicants[replicant_id].dynamic.transform.position
+                                obj_pos = self.object_manager.transforms[obj_id].position
+                                actual_distance = self.get_2d_distance(agent_pos, obj_pos)
+                                # If distance > 0.2m, it's likely too far for reliable pick_up
+                                # arrived_at=0.7 means we stop at 0.7m, but pick_up needs to be much closer (0.2m)
+                                if actual_distance > pick_distance_threshold:
+                                    distance_too_far = True
+                                    if hasattr(self, 'logger') and self.logger:
+                                        self.logger.warning(
+                                            "[TDW] pick_up_after_move: object_id=%d still too far (dist=%.2fm > %.2fm) after move_to_object, attempting closer approach",
+                                            obj_id,
+                                            actual_distance,
+                                            pick_distance_threshold,
+                                        )
+                            except Exception as e:
+                                if hasattr(self, 'logger') and self.logger:
+                                    self.logger.debug(
+                                        "[TDW] pick_up_after_move: failed to check distance for object_id=%d: %s",
+                                        obj_id,
+                                        e,
+                                    )
+                        
+                        # If too far, try to move closer using move_to_position
+                        # TDW's pick_up requires <= 1.5m, but we need to be much closer (<= 0.2m) for reliable success
+                        # move_to_object uses arrived_at=0.7, which is too far for pick_up
+                        # BUT: Limit retry count to prevent infinite loop
+                        max_closer_move_retries = 5  # Maximum 5 attempts to get closer (increased from 3)
+                        closer_move_retry_count = curr_action.get('closer_move_retry_count', 0)
+                        
+                        if distance_too_far and obj_id in self.object_manager.transforms and closer_move_retry_count < max_closer_move_retries:
+                            try:
+                                # Try moving closer by calling move_to_position
+                                # Calculate a position closer to the object (0.2m away for pick)
+                                obj_pos = np.array(self.object_manager.transforms[obj_id].position)
+                                agent_pos = self.controller.replicants[replicant_id].dynamic.transform.position
+                                agent_pos_arr = np.array([agent_pos[0], agent_pos[2]])
+                                obj_pos_2d = np.array([obj_pos[0], obj_pos[2]])
+                                
+                                # Calculate direction vector from agent to object
+                                direction = obj_pos_2d - agent_pos_arr
+                                distance_2d = np.linalg.norm(direction)
+                                
+                                # Only try to move closer if we're still > 0.2m away
+                                # If we're within 0.2m, just try pick_up
+                                if distance_2d > pick_distance_threshold:
+                                    # Move to a position 0.2m away from the object
+                                    target_distance = pick_distance_threshold
+                                    direction_normalized = direction / distance_2d
+                                    target_pos_2d = obj_pos_2d - direction_normalized * target_distance
+                                    target_pos = np.array([target_pos_2d[0], obj_pos[1], target_pos_2d[1]])
+                                    
+                                    if hasattr(self, 'logger') and self.logger:
+                                        self.logger.info(
+                                            "[TDW] pick_up_after_move: object_id=%d still too far (dist=%.2fm > %.2fm), moving closer to %.2fm (retry %d/%d)",
+                                            obj_id,
+                                            actual_distance,
+                                            pick_distance_threshold,
+                                            target_distance,
+                                            closer_move_retry_count + 1,
+                                            max_closer_move_retries,
+                                        )
+                                    # Use move_to_position to get closer with smaller arrived_at (0.2m for pick)
+                                    self.controller.replicants[replicant_id].move_to_position(target=target_pos, arrived_at=target_distance)
+                                    # Check if move_to_position is still ongoing - if so, wait for it to complete
+                                    # Put the action back in buffer to retry pick after moving closer
+                                    # Mark that we're waiting for move_to_position to complete
+                                    curr_action['waiting_for_closer_move'] = True
+                                    self.action_buffer[replicant_id].insert(0, curr_action)
+                                    continue
+                                else:
+                                    # Already close enough (within 0.2m), proceed with pick_up
+                                    if hasattr(self, 'logger') and self.logger:
+                                        self.logger.debug(
+                                            "[TDW] pick_up_after_move: object_id=%d at dist=%.2fm (within %.2fm), proceeding with pick_up",
+                                            obj_id,
+                                            actual_distance,
+                                            pick_distance_threshold,
+                                        )
+                            except Exception as e:
+                                if hasattr(self, 'logger') and self.logger:
+                                    self.logger.warning(
+                                        "[TDW] pick_up_after_move: failed to check position for object_id=%d: %s, proceeding with pick_up anyway",
+                                        obj_id,
+                                        e,
+                                    )
+                        elif distance_too_far and closer_move_retry_count >= max_closer_move_retries:
+                            # Max retries reached, proceed with pick_up anyway (might still work if within 1.5m)
+                            if hasattr(self, 'logger') and self.logger:
+                                self.logger.warning(
+                                    "[TDW] pick_up_after_move: object_id=%d still too far (dist=%.2fm > %.2fm) after %d retries, proceeding with pick_up anyway (TDW allows up to 1.5m)",
+                                    obj_id,
+                                    actual_distance,
+                                    pick_distance_threshold,
+                                    max_closer_move_retries,
+                                )
+                        
+                        # Now attempt pick_up
                         try:
                             # pick_up automatically selects arm (right hand preferred, left if right is occupied)
                             self.controller.replicants[replicant_id].pick_up(target=obj_id)
                             if hasattr(self, 'logger') and self.logger:
-                                self.logger.debug(
-                                    "[TDW] pick_up: called for object_id=%d after move_to_object completed (replicant_id=%d)",
-                                    obj_id,
-                                    replicant_id,
-                                )
+                                if actual_distance is not None:
+                                    if closer_move_retry_count >= max_closer_move_retries:
+                                        self.logger.warning(
+                                            "[TDW] pick_up: called for object_id=%d after %d closer move retries (dist=%.2fm > %.2fm, may fail)",
+                                            obj_id,
+                                            max_closer_move_retries,
+                                            actual_distance,
+                                            pick_distance_threshold,
+                                        )
+                                    else:
+                                        self.logger.debug(
+                                            "[TDW] pick_up: called for object_id=%d after move_to_object completed (replicant_id=%d, dist=%.2fm)",
+                                            obj_id,
+                                            replicant_id,
+                                            actual_distance,
+                                        )
+                                else:
+                                    self.logger.debug(
+                                        "[TDW] pick_up: called for object_id=%d after move_to_object completed (replicant_id=%d)",
+                                        obj_id,
+                                        replicant_id,
+                                    )
+                            # pick_up is now in progress, it will complete in a subsequent frame
+                            # The status will be checked in the next frame by the policy/agent
+                            # If it fails, the policy will handle retry or skip based on pick_fail_count
+                            valid[replicant_id] = True
+                            # Remove from buffer - pick_up is now executing, status will be checked next frame
                         except Exception as e:
                             if hasattr(self, 'logger') and self.logger:
                                 self.logger.warning(
@@ -993,6 +1236,10 @@ class TDW(Env):
                                         if not hasattr(self, 'satisfied'):
                                             self.satisfied = {}
                                         self.satisfied[held_obj] = True
+                                        # Store put_in success for this agent to include in obs
+                                        if replicant_id not in self.put_in_success:
+                                            self.put_in_success[replicant_id] = []
+                                        self.put_in_success[replicant_id].append(held_obj)
                                         if self.logger:
                                             self.logger.info(
                                                 "[TDW] put_in success: object_id=%d delivered to goal_position_id=%d (dist=%.2f)",
@@ -1068,7 +1315,14 @@ class TDW(Env):
                     .format(self.num_step, action["type"],
                     time.time() - start,
                     task_status))
-            container_info = self.add_name_and_empty(copy.deepcopy(self.controller.state.containment))
+            # Use shallow copy to avoid recursion error with containment structure
+            try:
+                container_info = self.add_name_and_empty(copy.deepcopy(self.controller.state.containment))
+            except RecursionError:
+                # Fallback to shallow copy if deepcopy fails due to circular references
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.warning("[TDW] deepcopy containment failed, using shallow copy")
+                container_info = self.add_name_and_empty(copy.copy(self.controller.state.containment))
             self.f.write('position: {}, forward: {}, containment: {}, goal: {}, container: {}\n'.format(
                     self.controller.replicants[replicant_id].dynamic.transform.position,
                     self.controller.replicants[replicant_id].dynamic.transform.forward,
@@ -1094,6 +1348,18 @@ class TDW(Env):
         for replicant_id in self.controller.replicants:
             obs[str(replicant_id)]['valid'] = valid[replicant_id]
             obs[str(replicant_id)]['current_frames'] = self.num_frames
+            # Add put_in_success information to obs
+            # Pad to fixed length 10 to match observation space (Tuple)
+            if replicant_id in self.put_in_success and self.put_in_success[replicant_id]:
+                put_in_list = self.put_in_success[replicant_id].copy()
+                # Pad with 0 (invalid object_id) to length 10
+                while len(put_in_list) < 10:
+                    put_in_list.append(0)
+                obs[str(replicant_id)]['put_in_success'] = tuple(put_in_list[:10])  # Ensure exactly 10 elements
+                # Clear after adding to obs (only keep for one step)
+                self.put_in_success[replicant_id] = []
+            else:
+                obs[str(replicant_id)]['put_in_success'] = tuple([0] * 10)  # Empty list padded with zeros
 
         info = self.get_info()
         info['done'] = done

@@ -102,15 +102,16 @@ class ReplicantTransportChallenge(Replicant):
         """
         self.move_to(target=target, reset_arms=False, arrived_at=0.7) #if target in self._state.target_object_ids else 0.1)
     
-    def move_to_position(self, target: np.ndarray) -> None:
+    def move_to_position(self, target: np.ndarray, arrived_at: float = 0.7) -> None:
         """
         Move to an position. This calls `self.move_to(target)`.
 
-        :param target: The object ID.
+        :param target: The target position as a 3D numpy array.
+        :param arrived_at: Distance threshold to consider arrival (default: 0.7m). Use smaller values (e.g., 0.3m) for pick actions.
         """
         assert isinstance(target, np.ndarray) and target.shape == (3,), f"target must be a 3D numpy array. Got {target}"
         target[1] = 0
-        self.move_to(target=target, reset_arms=False, arrived_at=0.7)
+        self.move_to(target=target, reset_arms=False, arrived_at=arrived_at)
         
     def pick_up(self, target: int) -> None:
         """

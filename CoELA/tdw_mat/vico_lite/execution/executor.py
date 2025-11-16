@@ -78,19 +78,55 @@ class PlanExecutor:
             meta.update({"reason": "no_target_position"})
             return {"type": "ongoing"}, meta
         
-        # Navigate to target first
-        command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True)
-        meta.update(nav_meta)
-        
-        # Calculate actual distance from agent to target AFTER navigation (not path_len)
+        # CRITICAL: Check distance FIRST before deciding navigation method
+        # This ensures we can detect when agent is close enough for put_in even during continuous navigation
+        # Calculate actual distance from agent to target
         actual_distance = float("inf")
+        goal_position_id = None
+        if self.env_api is not None:
+            if isinstance(self.env_api, dict):
+                goal_position_id = self.env_api.get("goal_position_id")
+            elif hasattr(self.env_api, "goal_position_id"):
+                goal_position_id = self.env_api.goal_position_id
+        
+        # Check if target_id is goal_position_id - if so, we need to check distance to goal_position_id
+        is_goal_position = (goal_position_id is not None and target_id == goal_position_id) or plan.meta.get("is_goal_position", False)
+        
         if self.agent_memory is not None and hasattr(self.agent_memory, "position") and self.agent_memory.position is not None:
             try:
                 agent_pos = self.agent_memory.position
                 if isinstance(agent_pos, (list, tuple, np.ndarray)) and len(agent_pos) >= 3:
                     agent_arr = np.array([agent_pos[0], agent_pos[2]])
-                    target_arr = np.array([target_pos[0], target_pos[2] if len(target_pos) > 2 else target_pos[1]])
-                    actual_distance = float(np.linalg.norm(agent_arr - target_arr))
+                    
+                    # If this is goal_position_id, try to get actual goal_position_id position
+                    if is_goal_position and goal_position_id is not None:
+                        # Try to get goal_position_id position from agent_memory or env_api
+                        goal_pos = None
+                        if hasattr(self.agent_memory, "object_info") and goal_position_id in self.agent_memory.object_info:
+                            goal_pos = self.agent_memory.object_info[goal_position_id].get("position")
+                        if goal_pos is None and hasattr(self.agent_memory, "get_object_list"):
+                            # Try to get from get_object_list which has goal_position_id position
+                            try:
+                                obj_list = self.agent_memory.get_object_list()
+                                for obj in obj_list:
+                                    if obj.get("id") == goal_position_id:
+                                        goal_pos = obj.get("position")
+                                        break
+                            except Exception:
+                                pass
+                        
+                        if goal_pos is not None:
+                            if isinstance(goal_pos, (list, tuple, np.ndarray)) and len(goal_pos) >= 3:
+                                goal_arr = np.array([goal_pos[0], goal_pos[2]])
+                                actual_distance = float(np.linalg.norm(agent_arr - goal_arr))
+                        else:
+                            # Fallback to target_pos if goal_position_id position not available
+                            target_arr = np.array([target_pos[0], target_pos[2] if len(target_pos) > 2 else target_pos[1]])
+                            actual_distance = float(np.linalg.norm(agent_arr - target_arr))
+                    else:
+                        # Not goal_position_id, use target_pos
+                        target_arr = np.array([target_pos[0], target_pos[2] if len(target_pos) > 2 else target_pos[1]])
+                        actual_distance = float(np.linalg.norm(agent_arr - target_arr))
             except Exception as exc:
                 if self.logger:
                     self.logger.debug("[Executor] deliver: failed to calculate actual distance: %s", exc)
@@ -102,20 +138,51 @@ class PlanExecutor:
             if actual_distance == float("inf") or plan_distance < actual_distance:
                 actual_distance = plan_distance
         
-        # If we're close enough (actual distance, not path_len), execute put_in
-        if actual_distance is not None and actual_distance <= 3.0:  # Increased threshold to 3.0m
-            # Close enough to put_in
+        # If we're close enough (actual distance, not path_len), execute put_in IMMEDIATELY
+        # TDW PutIn requires agent to be close to goal_position_id (must be < 3.0m for success)
+        # For goal_position_id, use 2.5m threshold to ensure we're well within 3.0m limit
+        # For other containers, use 2.0m threshold
+        distance_threshold = 2.5 if is_goal_position else 2.0
+        if actual_distance is not None and actual_distance <= distance_threshold:
+            # Close enough to put_in - execute immediately
             if self.logger:
                 self.logger.info(
-                    "[Executor] deliver: close enough (actual_dist=%.2f), executing put_in",
+                    "[Executor] deliver: close enough (actual_dist=%.2f <= %.2f), executing put_in immediately",
                     actual_distance,
+                    distance_threshold,
                 )
             # Execute put_in action (type 4)
             command = {"type": 4}
             meta.update({"result": "put_in", "distance": actual_distance, "actual_distance": actual_distance})
-        elif nav_meta.get("forced_failure"):
-            # Navigation failed, but still try put_in if we have target_id and we're reasonably close
-            if target_id is not None and actual_distance <= 5.0:
+            return command, meta
+        
+        # Not close enough yet - navigate to target first
+        # For deliver actions, use continuous navigation if distance > 3.0m to avoid guard blocking
+        # This ensures we can get close enough for put_in to succeed
+        use_continuous_for_deliver = False
+        if actual_distance != float("inf"):
+            # Use continuous navigation for deliver if distance > 3.0m (to avoid guard blocking)
+            # This is lower than the normal 5.0m threshold to ensure deliver can proceed
+            use_continuous_for_deliver = actual_distance > 3.0
+        
+        if use_continuous_for_deliver and self.cfg.use_continuous_navigation:
+            # Force continuous navigation for deliver to avoid guard blocking
+            action = {
+                "type": 9,  # Continuous movement
+                "target_position": target_pos,
+            }
+            nav_meta = {
+                "navigation": "continuous_move_to_position",
+                "distance": actual_distance,
+                "method": "continuous",
+            }
+            command = action
+            meta.update(nav_meta)
+        else:
+            command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True)
+            meta.update(nav_meta)
+            # Check if navigation failed but we're still close enough
+            if nav_meta.get("forced_failure") and actual_distance <= distance_threshold:
                 if self.logger:
                     self.logger.info(
                         "[Executor] deliver: navigation failed but close enough (dist=%.2f), attempting put_in",
@@ -127,7 +194,7 @@ class PlanExecutor:
         return command, meta
 
     # ---------------------------------------------------------------------
-    def _navigate_to(self, target_pos, agent_state, follow: bool = False, skip_clamp: bool = False):
+    def _navigate_to(self, target_pos, agent_state, follow: bool = False, skip_clamp: bool = False, arrived_at: Optional[float] = None):
         meta: Dict[str, Any] = {"navigation": "idle"}
         if target_pos is None:
             return {"type": "ongoing"}, meta
@@ -199,14 +266,19 @@ class PlanExecutor:
                     target_pos,
                 )
             # Return continuous movement action (type 9)
+            # Use smaller arrived_at for pick actions (0.3m) to get closer to objects
+            if arrived_at is None:
+                arrived_at = 0.7  # Default for general navigation
             action = {
                 "type": 9,  # New action type for continuous movement
                 "target_position": target_pos,
+                "arrived_at": arrived_at,  # Can be 0.3m for pick, 0.7m for general navigation
             }
             meta.update({
                 "navigation": "continuous_move_to_position",
                 "distance": distance_to_target,
                 "method": "continuous",
+                "arrived_at": arrived_at,
             })
             return action, meta
         else:
@@ -246,15 +318,33 @@ class PlanExecutor:
         is_force_pick = plan.meta.get("override") == "near_grabbable" or plan.meta.get("reason") == "policy_override_grabbable"
         force_pick_distance = plan.meta.get("distance")
         
-        # Reject invalid positions (0,0,0 is likely a default/placeholder)
-        if target_pos is not None and (target_pos == (0.0, 0.0, 0.0) or (abs(target_pos[0]) < 0.01 and abs(target_pos[2]) < 0.01)):
-            if self.logger:
-                self.logger.warning(
-                    "[Executor] rejecting pick with invalid target_pos (0,0,0): target_id=%s",
-                    plan.target_id,
-                )
-            meta.update({"reason": "invalid_target_position"})
-            return {"type": "ongoing"}, meta
+        # 핵심 수정: target_pos가 (0,0,0)이어도 object_id가 있으면 reach_for 사용
+        # LLM이 잘못된 위치를 제안해도 object_id만으로 pick 시도 가능
+        target_id = plan.target_id
+        is_task_target = plan.meta.get("is_task_target", False)
+        has_invalid_position = target_pos is not None and (target_pos == (0.0, 0.0, 0.0) or (abs(target_pos[0]) < 0.01 and abs(target_pos[2]) < 0.01))
+        
+        if has_invalid_position:
+            if target_id is not None and (is_task_target or is_force_pick):
+                # object_id가 있고 task target이면 reach_for 사용 (object_id만으로 pick 시도)
+                if self.logger:
+                    self.logger.info(
+                        "[Executor] pick: invalid target_pos (0,0,0) but object_id=%s exists, using reach_for with object_id only",
+                        target_id,
+                    )
+                # target_pos를 None으로 설정하여 object_id만으로 pick 시도
+                target_pos = None
+                meta["navigation"] = "reach_for_with_object_id"
+                meta["note"] = "invalid_position_using_object_id_reach_for"
+            else:
+                # object_id가 없거나 task target이 아니면 reject
+                if self.logger:
+                    self.logger.warning(
+                        "[Executor] rejecting pick with invalid target_pos (0,0,0) and no valid object_id: target_id=%s",
+                        target_id,
+                    )
+                meta.update({"reason": "invalid_target_position"})
+                return {"type": "ongoing"}, meta
         
         # 핵심 수정: object_id 체크 전에 navigation 먼저 시작
         # 10m 제한으로 인해 object_info에 없어도 navigation은 시도해야 함
@@ -272,7 +362,8 @@ class PlanExecutor:
                 meta["navigation"] = "skip_direct_pick"
                 meta["distance"] = force_pick_distance
             elif not is_force_pick:
-                navigation_command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True, skip_clamp=True)
+                # Use smaller arrived_at (0.3m) for pick actions to get closer to objects
+                navigation_command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True, skip_clamp=True, arrived_at=0.3)
                 meta.update(nav_meta)
                 navigation_started = True
                 if nav_meta.get("forced_failure"):
@@ -283,7 +374,8 @@ class PlanExecutor:
                         )
                     return navigation_command, meta
             else:  # is_force_pick and distance > 2.0
-                navigation_command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True, skip_clamp=True)
+                # Use smaller arrived_at (0.3m) for pick actions to get closer to objects
+                navigation_command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True, skip_clamp=True, arrived_at=0.3)
                 meta.update(nav_meta)
                 navigation_started = True
                 if nav_meta.get("forced_failure"):
@@ -297,6 +389,8 @@ class PlanExecutor:
             # 핵심 수정: target_pos is None이지만 distance가 있으면 navigation 시도 (task target인 경우)
             # 10m 제한으로 인해 위치 계산이 실패했지만 depth로 거리는 알 수 있는 경우
             is_task_target = plan.meta.get("is_task_target", False)
+            retry_navigation = plan.meta.get("reason") == "retry_navigation_after_failure"
+            
             if is_force_pick and force_pick_distance is not None:
                 if force_pick_distance <= 2.5:
                     # Close enough for direct pick
@@ -308,12 +402,12 @@ class PlanExecutor:
                     meta["navigation"] = "skip_no_position"
                     meta["distance"] = force_pick_distance
                     meta["note"] = "pick_without_position"
-                elif is_task_target:
-                    # Task target but too far - use reach_for (type 3) which automatically navigates to object_id
+                elif is_task_target or retry_navigation:
+                    # Task target or navigation retry - use reach_for (type 3) which automatically navigates to object_id
                     # reach_for will handle navigation automatically when given object_id
                     if self.logger:
                         self.logger.info(
-                            "[Executor] pick: no position but task target distance=%.2f, using reach_for with object_id only",
+                            "[Executor] pick: no position but task target/retry distance=%.2f, using reach_for with object_id only",
                             force_pick_distance,
                         )
                     meta["navigation"] = "reach_for_with_object_id"
@@ -329,14 +423,36 @@ class PlanExecutor:
                         )
                     meta.update({"reason": "no_position_and_too_far"})
                     return {"type": "ongoing"}, meta
+            elif retry_navigation and force_pick_distance is not None:
+                # Navigation retry: use reach_for even if not force_pick
+                if self.logger:
+                    self.logger.info(
+                        "[Executor] pick: navigation retry, no position but distance=%.2f, using reach_for with object_id only",
+                        force_pick_distance,
+                    )
+                meta["navigation"] = "reach_for_with_object_id"
+                meta["distance"] = force_pick_distance
+                meta["note"] = "no_position_using_object_id_reach_for"
+                # Will use reach_for (type 3) below - skip to pick section
             else:
                 # Position is None and distance is unknown
-                if self.logger:
-                    self.logger.debug(
-                        "[Executor] pick: target_pos is None and distance unknown, skipping pick",
-                    )
-                meta.update({"reason": "no_position_and_no_distance"})
-                return {"type": "ongoing"}, meta
+                # But if it's a task target and object_id exists, try reach_for anyway
+                if is_task_target and plan.target_id is not None:
+                    if self.logger:
+                        self.logger.info(
+                            "[Executor] pick: target_pos is None and distance unknown, but is_task_target=True and object_id=%s exists, using reach_for",
+                            plan.target_id,
+                        )
+                    meta["navigation"] = "reach_for_with_object_id"
+                    meta["note"] = "no_position_using_object_id_reach_for"
+                    # Will use reach_for (type 3) below - skip to pick section
+                else:
+                    if self.logger:
+                        self.logger.debug(
+                            "[Executor] pick: target_pos is None and distance unknown, skipping pick",
+                        )
+                    meta.update({"reason": "no_position_and_no_distance"})
+                    return {"type": "ongoing"}, meta
         
         # Now attempt pick
         target_id = plan.target_id
@@ -451,7 +567,8 @@ class PlanExecutor:
         
         # 핵심 수정: target_pos가 None이고 object_id만 있는 경우, reach_for (type 3)를 바로 사용
         # reach_for는 자동으로 navigation을 수행하므로 거리 체크를 건너뜀
-        if target_pos is None and meta.get("note") == "no_position_using_object_id_reach_for":
+        # invalid_position_using_object_id_reach_for 케이스도 포함
+        if target_pos is None and (meta.get("note") == "no_position_using_object_id_reach_for" or meta.get("note") == "invalid_position_using_object_id_reach_for"):
             # Use reach_for (type 3) which will automatically navigate to object_id
             holding_slots = agent_state.get("holding_slots", {}) if isinstance(agent_state, dict) else {}
             left_busy = holding_slots.get("left") is not None
@@ -463,11 +580,13 @@ class PlanExecutor:
             command = {"type": 3, "object": target_id_int, "arm": arm}
             meta.update({"result": "attempt_pick_with_reach_for", "arm": arm, "distance": force_pick_distance})
             if self.logger:
+                # Handle None distance for logging
+                dist_str = f"{force_pick_distance:.2f}" if force_pick_distance is not None else "unknown"
                 self.logger.info(
-                    "[Executor] using reach_for (type 3) with object_id only: id=%s arm=%s dist=%.2f",
+                    "[Executor] using reach_for (type 3) with object_id only: id=%s arm=%s dist=%s",
                     target_id_int,
                     arm,
-                    force_pick_distance,
+                    dist_str,
                 )
             return command, meta
         

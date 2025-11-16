@@ -45,7 +45,7 @@ class ViCoPolicy:
             "holding_ids": [],
             "holding_ids_preserve_frame": -1,  # Frame when holding_ids was last preserved
             "pending_pick_verification": {},  # {pick_id: frame} - pick success 후 held_objects 확인 대기
-            "skip_targets": {"names": set(), "coords": set()},
+            "skip_targets": {"names": set(), "coords": set(), "ids": set()},
             "current_room": None,
             "heuristic_streak": 0,
         }
@@ -75,7 +75,7 @@ class ViCoPolicy:
             "role": "explore",
             "subgoal": "search",
             "holding_ids": [],
-            "skip_targets": {"names": set(), "coords": set()},
+            "skip_targets": {"names": set(), "coords": set(), "ids": set()},
             "current_room": None,
             "heuristic_streak": 0,
             "visible_summary": [],
@@ -187,20 +187,23 @@ class ViCoPolicy:
                             self.agent_state["holding_ids"] = current_holding_ids
                             # Reset preserve frame since we just confirmed a pick
                             self.agent_state["holding_ids_preserve_frame"] = frame
-                            if self.logger:
-                                self.logger.info(
-                                    "[Policy] pick success: added to holding_ids id=%s holding_ids=%s",
-                                    pick_id,
-                                    current_holding_ids,
-                                )
-                        # Get object name from visible_objects or object_info
-                        obj_name = None
-                        if self.agent_memory is not None and hasattr(self.agent_memory, "object_info"):
-                            obj_info = self.agent_memory.object_info.get(pick_id)
-                            if obj_info:
-                                obj_name = obj_info.get("name")
-                        if obj_name:
-                            self._register_skip_target(name=obj_name)
+                        if self.logger:
+                            self.logger.info(
+                                "[Policy] pick success: added to holding_ids id=%s holding_ids=%s",
+                                pick_id,
+                                current_holding_ids,
+                            )
+                        # Pick 성공 시 실패 횟수 초기화
+                        if "pick_fail_count" in self.agent_state and pick_id in self.agent_state["pick_fail_count"]:
+                            del self.agent_state["pick_fail_count"][pick_id]
+                    # Get object name from visible_objects or object_info
+                    obj_name = None
+                    if self.agent_memory is not None and hasattr(self.agent_memory, "object_info"):
+                        obj_info = self.agent_memory.object_info.get(pick_id)
+                        if obj_info:
+                            obj_name = obj_info.get("name")
+                    if obj_name:
+                        self._register_skip_target(name=obj_name)
                     # Clear last_command since pick is confirmed successful
                     self.agent_state.pop("last_command", None)
                     self.agent_state.pop("last_pick_id", None)
@@ -270,12 +273,50 @@ class ViCoPolicy:
                                 pick_id,
                                 current_holding_ids,
                             )
-                last_pick_pos = self.agent_state.get("last_pick_pos")
-                if last_pick_pos is not None:
-                    self._register_skip_target(position=last_pick_pos)
-            self.agent_state.pop("last_command", None)
-            self.agent_state.pop("last_pick_id", None)
-            self.agent_state.pop("last_pick_pos", None)
+                    
+                    # Pick 실패 횟수 추적
+                    pick_fail_count = self.agent_state.get("pick_fail_count", {}).get(pick_id, 0)
+                    pick_fail_count += 1
+                    if "pick_fail_count" not in self.agent_state:
+                        self.agent_state["pick_fail_count"] = {}
+                    self.agent_state["pick_fail_count"][pick_id] = pick_fail_count
+                    
+                    # Pick 실패가 3회 이상이면 skip_targets에 추가 (재시도 포기)
+                    # 하지만 3회 미만이면 재시도 가능하도록 skip하지 않음
+                    if pick_fail_count >= 3:
+                        last_pick_pos = self.agent_state.get("last_pick_pos")
+                        if last_pick_pos is not None:
+                            self._register_skip_target(position=last_pick_pos)
+                        if self.logger:
+                            self.logger.warning(
+                                "[Policy] pick failed %d times for id=%s, adding position to skip_targets to prevent infinite retry",
+                                pick_fail_count,
+                                pick_id,
+                            )
+                        # object_id도 skip_targets에 추가
+                        self._register_skip_target(object_id=pick_id)
+                        # Navigation 관련 state clear (다른 객체로 전환)
+                        self.agent_state.pop("last_command", None)
+                        self.agent_state.pop("last_pick_id", None)
+                        self.agent_state.pop("last_pick_pos", None)
+                        # 실패 횟수 초기화
+                        del self.agent_state["pick_fail_count"][pick_id]
+                    else:
+                        # 아직 재시도 가능 - state 유지하여 재시도 가능하도록
+                        if self.logger:
+                            self.logger.info(
+                                "[Policy] pick failed %d/3 times for id=%s, will retry (keeping state)",
+                                pick_fail_count,
+                                pick_id,
+                            )
+                        # last_pick_id와 last_pick_pos는 유지하여 재시도 가능하도록
+                        # last_command만 clear하여 새로운 navigation 시도 가능
+                        self.agent_state.pop("last_command", None)
+                else:
+                    # pick_id가 None이면 state clear
+                    self.agent_state.pop("last_command", None)
+                    self.agent_state.pop("last_pick_id", None)
+                    self.agent_state.pop("last_pick_pos", None)
         elif last_command == "pick" and self.logger:
             self.logger.debug(
                 "[Policy] pick command pending: status=%s (type=%s) frame=%s",
@@ -290,6 +331,68 @@ class ViCoPolicy:
         bridge_output = self.memory_bridge.process(perception_input)
         snapshot = bridge_output["snapshot"]
         visible_infos = perception_input.get("object_infos", [])
+        
+        # 핵심 수정: snapshot.team_symbolic에서 task target 정보를 확인하여 visible_infos의 is_task_target 업데이트
+        # _prepare_perception_inputs에서는 _task_target_lookup만 확인하므로, snapshot.team_symbolic의 정보를 반영하지 못함
+        if snapshot and hasattr(snapshot, "team_symbolic") and snapshot.team_symbolic:
+            task_target_ids = set()
+            task_target_entries = []
+            for entry in snapshot.team_symbolic:
+                if entry.get("is_task_target") and entry.get("is_grabbable"):
+                    obj_id = entry.get("id")
+                    if obj_id is not None:
+                        task_target_ids.add(obj_id)
+                        task_target_entries.append(entry)
+            
+            # 디버깅: task_target_ids와 visible_infos의 id 비교
+            if self.logger and task_target_ids:
+                visible_ids = {info.get("id") for info in visible_infos if info.get("id") is not None}
+                matched_ids = task_target_ids & visible_ids
+                if matched_ids != task_target_ids:
+                    self.logger.debug(
+                        "[Policy] frame=%s task_target_ids from team_symbolic=%s, visible_ids=%s, matched=%s, missing=%s",
+                        frame,
+                        task_target_ids,
+                        visible_ids,
+                        matched_ids,
+                        task_target_ids - visible_ids,
+                    )
+            
+            # visible_infos의 is_task_target 업데이트
+            updated_count = 0
+            for info in visible_infos:
+                obj_id = info.get("id")
+                if obj_id is not None and obj_id in task_target_ids:
+                    old_is_task_target = info.get("is_task_target", False)
+                    info["is_task_target"] = True
+                    # is_grabbable도 True로 설정 (task target은 항상 grabbable)
+                    info["is_grabbable"] = True
+                    # priority도 업데이트
+                    if "priority" in info:
+                        info["priority"] = max(info.get("priority", 0.0), 4.0)
+                    else:
+                        info["priority"] = 4.0
+                    if not old_is_task_target:
+                        updated_count += 1
+                        if self.logger:
+                            self.logger.debug(
+                                "[Policy] frame=%s updated is_task_target=True for id=%s name=%s (from team_symbolic)",
+                                frame,
+                                obj_id,
+                                info.get("name"),
+                            )
+            
+            # 디버깅: 업데이트 결과 확인
+            if self.logger and task_target_ids:
+                final_task_target_count = sum(1 for info in visible_infos if info.get("is_task_target"))
+                if final_task_target_count == 0 and updated_count == 0:
+                    self.logger.warning(
+                        "[Policy] frame=%s WARNING: team_symbolic has %d task_targets but none matched visible_infos (task_target_ids=%s, visible_ids=%s)",
+                        frame,
+                        len(task_target_entries),
+                        task_target_ids,
+                        {info.get("id") for info in visible_infos if info.get("id") is not None},
+                    )
         # Check if navigation completed and we should retry pick
         # If last_command was navigation (move/search) and status indicates completion, retry pick if we were trying to pick
         # 방안 1: Navigation 완료 후 Pick Retry 강화
@@ -331,6 +434,11 @@ class ViCoPolicy:
             if last_pick_id is not None:
                 if prev_status == 1:  # Success - 완료
                     should_check_distance = True
+                    # Navigation 성공 시 실패 횟수 및 방법 초기화
+                    if "nav_fail_count" in self.agent_state and last_pick_id in self.agent_state["nav_fail_count"]:
+                        del self.agent_state["nav_fail_count"][last_pick_id]
+                    if "nav_method" in self.agent_state and last_pick_id in self.agent_state["nav_method"]:
+                        del self.agent_state["nav_method"][last_pick_id]
                 elif prev_status == 2:  # Failure - 실패했지만 거리 확인 후 clear
                     should_check_distance = True
                     should_clear_navigation = True  # 실패했으므로 navigation clear
@@ -406,15 +514,172 @@ class ViCoPolicy:
                                 )
                 
                 # Retry pick if we have valid target and distance
-                if target_pos is not None and distance is not None and distance <= 2.5:
+                # TDW's pick_up requires <= 1.5m, so we must get close enough
+                # Use 2.5m threshold to allow some margin (executor will check actual distance)
+                pick_distance_threshold = 2.5
+                
+                # 핵심 수정: Navigation 실패 시에도 object_id만으로 pick 시도
+                # target_pos가 None이거나 거리가 멀어도 object_id가 있으면 reach_for 사용
+                # BUT: 이미 holding 중인 object는 다시 pick 시도하지 않음
+                # AND: task target이 아닌 object는 pick 시도하지 않음
+                if target_pos is None and last_pick_id is not None:
+                    # Check if we're already holding this object
+                    holding_ids = self.agent_state.get("holding_ids", [])
+                    if last_pick_id in holding_ids:
+                        if self.logger:
+                            self.logger.debug(
+                                "[Policy] navigation failed but object_id=%s is already in holding_ids=%s, skipping pick retry",
+                                last_pick_id,
+                                holding_ids,
+                            )
+                        # Clear navigation state and return ongoing
+                        if should_clear_navigation:
+                            self.agent_state.pop("last_command", None)
+                            self.agent_state.pop("last_nav_start_frame", None)
+                            self.agent_state.pop("last_pick_id", None)
+                            self.agent_state.pop("last_pick_pos", None)
+                        return {"type": "ongoing"}
+                    
+                    # Check if last_pick_id is in skip_targets (already delivered or failed)
+                    skip_ids = self.agent_state.get("skip_targets", {}).get("ids", set())
+                    if last_pick_id in skip_ids:
+                        if self.logger:
+                            self.logger.debug(
+                                "[Policy] navigation failed but object_id=%s is in skip_targets (already delivered/failed), skipping pick retry",
+                                last_pick_id,
+                            )
+                        # Clear navigation state and return ongoing
+                        if should_clear_navigation:
+                            self.agent_state.pop("last_command", None)
+                            self.agent_state.pop("last_nav_start_frame", None)
+                            self.agent_state.pop("last_pick_id", None)
+                            self.agent_state.pop("last_pick_pos", None)
+                        return {"type": "ongoing"}
+                    
+                    # Check if last_pick_id is a task target
+                    is_task_target = False
+                    if visible_infos:
+                        for info in visible_infos:
+                            if info.get("id") == last_pick_id:
+                                is_task_target = info.get("is_task_target", False)
+                                if not obj_name:
+                                    obj_name = info.get("name")
+                                break
+                    
+                    # If not found in visible_infos, check in snapshot.team_symbolic
+                    if not is_task_target and snapshot and hasattr(snapshot, "team_symbolic") and snapshot.team_symbolic:
+                        for entry in snapshot.team_symbolic:
+                            if entry.get("id") == last_pick_id:
+                                is_task_target = entry.get("is_task_target", False)
+                                if not obj_name:
+                                    obj_name = entry.get("name")
+                                break
+                    
+                    # Skip if not a task target
+                    if not is_task_target:
+                        if self.logger:
+                            self.logger.warning(
+                                "[Policy] navigation failed but object_id=%s is not a task target, skipping pick retry and clearing last_pick_id (was trying to pick non-task object)",
+                                last_pick_id,
+                            )
+                        # Clear navigation state and return ongoing
+                        # IMPORTANT: Always clear last_pick_id if not a task target, even if should_clear_navigation is False
+                        self.agent_state.pop("last_command", None)
+                        self.agent_state.pop("last_nav_start_frame", None)
+                        self.agent_state.pop("last_pick_id", None)
+                        self.agent_state.pop("last_pick_pos", None)
+                        # Also clear nav_fail_count and nav_method for this object
+                        if "nav_fail_count" in self.agent_state and last_pick_id in self.agent_state["nav_fail_count"]:
+                            del self.agent_state["nav_fail_count"][last_pick_id]
+                        if "nav_method" in self.agent_state and last_pick_id in self.agent_state["nav_method"]:
+                            del self.agent_state["nav_method"][last_pick_id]
+                        return {"type": "ongoing"}
+                    
+                    # Navigation이 실패했지만 object_id가 있고 task target이면 reach_for로 pick 시도
+                    # reach_for는 자동으로 navigation을 수행하므로 거리 제한이 덜 엄격함
                     if self.logger:
                         self.logger.info(
-                            "[Policy] navigation completed/failed, retrying pick id=%s name=%s dist=%.2f (prev_status=%s)",
+                            "[Policy] navigation failed but object_id=%s exists and is task target, attempting pick with reach_for (no position)",
                             last_pick_id,
-                            obj_name or f"object_{last_pick_id}",
-                            distance,
-                            prev_status,
                         )
+                    pick_plan = ReasonedPlan(
+                        action_type="pick",
+                        target_id=last_pick_id,
+                        target_position=None,  # No position, use object_id only
+                        confidence=0.6,  # Lower confidence due to navigation failure
+                        meta={
+                            "reason": "retry_pick_after_nav_failure_no_position",
+                            "target_name": obj_name or f"object_{last_pick_id}",
+                            "distance": distance,
+                            "prev_status": prev_status,
+                            "is_task_target": True,
+                            "override": "near_grabbable",  # Force pick with object_id only
+                        },
+                    )
+                    command, exec_meta = self.executor.execute(pick_plan, snapshot, self.agent_state)
+                    self.agent_state.setdefault("recent_meta", []).append(exec_meta)
+                    command_type = command.get("type") if isinstance(command, dict) else None
+                    if command_type == 3:
+                        self.agent_state["last_command"] = "pick"
+                        self.agent_state["last_pick_id"] = last_pick_id
+                        self.agent_state["last_pick_pos"] = None  # No position
+                    # Navigation state clear (pick 시도했으므로)
+                    if should_clear_navigation:
+                        self.agent_state.pop("last_command", None)
+                        self.agent_state.pop("last_nav_start_frame", None)
+                    return command
+                
+                if target_pos is not None and distance is not None and distance <= pick_distance_threshold:
+                    # Check if last_pick_id is still a task target before retrying pick
+                    is_task_target = False
+                    if visible_infos:
+                        for info in visible_infos:
+                            if info.get("id") == last_pick_id:
+                                is_task_target = info.get("is_task_target", False)
+                                break
+                    if not is_task_target and snapshot and hasattr(snapshot, "team_symbolic") and snapshot.team_symbolic:
+                        for entry in snapshot.team_symbolic:
+                            if entry.get("id") == last_pick_id:
+                                is_task_target = entry.get("is_task_target", False)
+                                break
+                    
+                    # Skip if not a task target
+                    if not is_task_target:
+                        if self.logger:
+                            self.logger.warning(
+                                "[Policy] navigation completed but object_id=%s is not a task target anymore, skipping pick retry and clearing last_pick_id",
+                                last_pick_id,
+                            )
+                        # Clear navigation state
+                        self.agent_state.pop("last_command", None)
+                        self.agent_state.pop("last_nav_start_frame", None)
+                        self.agent_state.pop("last_pick_id", None)
+                        self.agent_state.pop("last_pick_pos", None)
+                        if "nav_fail_count" in self.agent_state and last_pick_id in self.agent_state["nav_fail_count"]:
+                            del self.agent_state["nav_fail_count"][last_pick_id]
+                        if "nav_method" in self.agent_state and last_pick_id in self.agent_state["nav_method"]:
+                            del self.agent_state["nav_method"][last_pick_id]
+                        return {"type": "ongoing"}
+                    
+                    if self.logger:
+                        if distance > 2.5:
+                            self.logger.info(
+                                "[Policy] navigation completed/failed, retrying pick id=%s name=%s dist=%.2f (relaxed threshold=%.2fm due to nav_fail_count=%d, prev_status=%s)",
+                                last_pick_id,
+                                obj_name or f"object_{last_pick_id}",
+                                distance,
+                                pick_distance_threshold,
+                                nav_fail_count,
+                                prev_status,
+                            )
+                        else:
+                            self.logger.info(
+                                "[Policy] navigation completed/failed, retrying pick id=%s name=%s dist=%.2f (prev_status=%s)",
+                                last_pick_id,
+                                obj_name or f"object_{last_pick_id}",
+                                distance,
+                                prev_status,
+                            )
                     pick_plan = ReasonedPlan(
                         action_type="pick",
                         target_id=last_pick_id,
@@ -425,6 +690,8 @@ class ViCoPolicy:
                             "target_name": obj_name or f"object_{last_pick_id}",
                             "distance": distance,
                             "prev_status": prev_status,
+                            "relaxed_threshold": distance > 2.5,
+                            "is_task_target": True,
                         },
                     )
                     command, exec_meta = self.executor.execute(pick_plan, snapshot, self.agent_state)
@@ -436,25 +703,155 @@ class ViCoPolicy:
                         self.agent_state["last_pick_pos"] = target_pos
                     # Clear navigation tracking
                     self.agent_state.pop("last_nav_start_frame", None)
+                    # Clear navigation fail count on pick attempt
+                    if "nav_fail_count" in self.agent_state and last_pick_id in self.agent_state["nav_fail_count"]:
+                        del self.agent_state["nav_fail_count"][last_pick_id]
                     return command
-                elif distance is not None and distance > 2.5:
-                    if self.logger:
-                        self.logger.debug(
-                            "[Policy] navigation completed/failed but still too far (dist=%.2f > 2.5m), not retrying pick id=%s",
-                            distance,
-                            last_pick_id,
-                        )
-                    # 거리가 너무 멀면 navigation clear (새로운 navigation 시도 가능하도록)
-                    if should_clear_navigation:
+                elif distance is not None and distance > pick_distance_threshold:
+                    # Navigation 실패 횟수 추적
+                    nav_fail_count = self.agent_state.get("nav_fail_count", {}).get(last_pick_id, 0)
+                    nav_method = self.agent_state.get("nav_method", {}).get(last_pick_id, None)  # 'continuous' or 'discrete'
+                    
+                    # Check if last_pick_id is still a task target before retrying navigation
+                    is_task_target = False
+                    if visible_infos:
+                        for info in visible_infos:
+                            if info.get("id") == last_pick_id:
+                                is_task_target = info.get("is_task_target", False)
+                                break
+                    if not is_task_target and snapshot and hasattr(snapshot, "team_symbolic") and snapshot.team_symbolic:
+                        for entry in snapshot.team_symbolic:
+                            if entry.get("id") == last_pick_id:
+                                is_task_target = entry.get("is_task_target", False)
+                                break
+                    
+                    # Skip if not a task target
+                    if not is_task_target:
                         if self.logger:
-                            self.logger.debug(
-                                "[Policy] clearing navigation state due to failure or timeout (dist=%.2f > 2.5m)",
-                                distance,
+                            self.logger.warning(
+                                "[Policy] navigation failed but object_id=%s is not a task target anymore, skipping navigation retry and clearing last_pick_id",
+                                last_pick_id,
                             )
+                        # Clear navigation state
                         self.agent_state.pop("last_command", None)
+                        self.agent_state.pop("last_nav_start_frame", None)
                         self.agent_state.pop("last_pick_id", None)
                         self.agent_state.pop("last_pick_pos", None)
-                        self.agent_state.pop("last_nav_start_frame", None)
+                        if "nav_fail_count" in self.agent_state and last_pick_id in self.agent_state["nav_fail_count"]:
+                            del self.agent_state["nav_fail_count"][last_pick_id]
+                        if "nav_method" in self.agent_state and last_pick_id in self.agent_state["nav_method"]:
+                            del self.agent_state["nav_method"][last_pick_id]
+                        return {"type": "ongoing"}
+                    
+                    # Navigation이 실패했지만 거리가 여전히 접근 가능한 범위이면 재시도
+                    # TDW의 pick_up은 1.5m 제한이 있으므로, 1.5m 이내로 접근할 때까지 navigation 시도
+                    max_distance_for_retry = 5.0  # 5m 이내면 계속 시도
+                    max_fail_count = 8  # 최대 8회까지 재시도
+                    
+                    if distance <= max_distance_for_retry and nav_fail_count < max_fail_count:
+                        # Navigation 실패 횟수 증가
+                        if "nav_fail_count" not in self.agent_state:
+                            self.agent_state["nav_fail_count"] = {}
+                        self.agent_state["nav_fail_count"][last_pick_id] = nav_fail_count + 1
+                        
+                        # Navigation 방법 전환: continuous <-> discrete
+                        # 같은 방법이 계속 실패하면 다른 방법 시도
+                        if nav_fail_count >= 3 and nav_fail_count % 2 == 1:
+                            # 3회 이상 실패하고 홀수 회차면 방법 전환
+                            new_method = "discrete" if nav_method == "continuous" else "continuous"
+                            if "nav_method" not in self.agent_state:
+                                self.agent_state["nav_method"] = {}
+                            self.agent_state["nav_method"][last_pick_id] = new_method
+                            if self.logger:
+                                self.logger.info(
+                                    "[Policy] navigation failed %d times, switching method from %s to %s (dist=%.2f, target_id=%s)",
+                                    nav_fail_count,
+                                    nav_method or "unknown",
+                                    new_method,
+                                    distance,
+                                    last_pick_id,
+                                )
+                        else:
+                            # 방법 유지
+                            if "nav_method" not in self.agent_state:
+                                self.agent_state["nav_method"] = {}
+                            if last_pick_id not in self.agent_state["nav_method"]:
+                                # 첫 시도면 continuous 시도 (거리가 멀면)
+                                self.agent_state["nav_method"][last_pick_id] = "continuous" if distance > 3.0 else "discrete"
+                        
+                        if self.logger:
+                            self.logger.info(
+                                "[Policy] navigation failed but retrying (dist=%.2f <= %.2fm, fail_count=%d/%d, method=%s), retrying navigation to pick id=%s",
+                                distance,
+                                max_distance_for_retry,
+                                nav_fail_count + 1,
+                                max_fail_count,
+                                self.agent_state["nav_method"].get(last_pick_id, "unknown"),
+                                last_pick_id,
+                            )
+                        # Navigation 재시도: 새로운 pick plan 생성하여 navigation부터 다시 시도
+                        # TDW의 pick_up은 1.5m 제한이 있으므로, 1.5m 이내로 접근할 때까지 navigation 시도
+                        # target_pos가 None이면 last_pick_pos 사용, 그것도 None이면 object_id만으로 시도
+                        retry_target_pos = target_pos if target_pos is not None else last_pick_pos
+                        pick_plan = ReasonedPlan(
+                            action_type="pick",
+                            target_id=last_pick_id,
+                            target_position=retry_target_pos,
+                            confidence=0.7,  # Lower confidence due to previous failures
+                            meta={
+                                "reason": "retry_navigation_after_failure",
+                                "target_name": obj_name or f"object_{last_pick_id}",
+                                "distance": distance,
+                                "prev_status": prev_status,
+                                "nav_fail_count": nav_fail_count + 1,
+                                "nav_method": self.agent_state["nav_method"].get(last_pick_id, "unknown"),
+                                "is_task_target": True,  # Navigation 재시도는 task target에 대한 것이므로
+                                "override": "near_grabbable" if retry_target_pos is None else None,  # position이 없으면 force_pick으로 처리
+                            },
+                        )
+                        command, exec_meta = self.executor.execute(pick_plan, snapshot, self.agent_state)
+                        self.agent_state.setdefault("recent_meta", []).append(exec_meta)
+                        command_type = command.get("type") if isinstance(command, dict) else None
+                        # Navigation 명령이면 last_command 업데이트
+                        if command_type in (0, 1, 2, 9):
+                            self.agent_state["last_command"] = str(command_type) if command_type != 9 else "continuous_move"
+                            self.agent_state["last_pick_id"] = last_pick_id
+                            self.agent_state["last_pick_pos"] = target_pos
+                            self.agent_state["last_nav_start_frame"] = frame
+                        # Pick 명령이면 (거리가 충분히 가까워진 경우)
+                        elif command_type == 3:
+                            self.agent_state["last_command"] = "pick"
+                            self.agent_state["last_pick_id"] = last_pick_id
+                            self.agent_state["last_pick_pos"] = target_pos
+                        return command
+                    else:
+                        # 너무 많이 실패했거나 거리가 너무 멀면 clear
+                        if self.logger:
+                            self.logger.warning(
+                                "[Policy] navigation failed too many times or too far (dist=%.2f > %.2fm or fail_count=%d >= %d), giving up pick id=%s",
+                                distance,
+                                max_distance_for_retry,
+                                nav_fail_count,
+                                max_fail_count,
+                                last_pick_id,
+                            )
+                        # Navigation 실패 횟수 및 방법 초기화
+                        if "nav_fail_count" in self.agent_state and last_pick_id in self.agent_state["nav_fail_count"]:
+                            del self.agent_state["nav_fail_count"][last_pick_id]
+                        if "nav_method" in self.agent_state and last_pick_id in self.agent_state["nav_method"]:
+                            del self.agent_state["nav_method"][last_pick_id]
+                        # 거리가 너무 멀면 navigation clear (새로운 navigation 시도 가능하도록)
+                        if should_clear_navigation:
+                            if self.logger:
+                                self.logger.debug(
+                                    "[Policy] clearing navigation state due to failure or timeout (dist=%.2f > %.2fm)",
+                                    distance,
+                                    max_distance_for_retry,
+                                )
+                            self.agent_state.pop("last_command", None)
+                            self.agent_state.pop("last_pick_id", None)
+                            self.agent_state.pop("last_pick_pos", None)
+                            self.agent_state.pop("last_nav_start_frame", None)
             # Navigation이 실패했거나 타임아웃되었으면 clear
             if should_clear_navigation and not should_check_distance:
                 if self.logger:
@@ -481,7 +878,8 @@ class ViCoPolicy:
                 # Explore로 위치 변경 - 더 적극적으로 다른 위치로 이동
                 # blocked_coords를 추가하여 같은 위치로 이동하지 않도록 함
                 blocked_coords = self.agent_state.get("blocked_coords", set())
-                current_pos = snapshot.get("agent_position")
+                # Get agent position from obs, not snapshot (snapshot is SharedStateSnapshot dataclass)
+                current_pos = obs.get("agent_position") or obs.get("position")
                 if current_pos:
                     blocked_coords.add(tuple(current_pos[:2]))  # (x, z) 좌표만 사용
                     self.agent_state["blocked_coords"] = blocked_coords
@@ -644,9 +1042,9 @@ class ViCoPolicy:
                 can_deliver = actual_holding_ids or (preserve_frame >= 0 and (current_frame - preserve_frame) < 5)
                 if can_deliver:
                     deliver_plan = self._maybe_force_deliver(visible_infos, actual_holding_ids=actual_holding_ids)
-                    if deliver_plan is not None:
-                        plan = deliver_plan
-                        override_used = True
+                if deliver_plan is not None:
+                    plan = deliver_plan
+                    override_used = True
                 elif self.logger:
                     self.logger.debug(
                         "[Policy] _maybe_force_deliver: skipping - no actual held_objects (holding_ids=%s, actual=%s, preserve_frame=%d)",
@@ -655,18 +1053,18 @@ class ViCoPolicy:
                         preserve_frame,
                     )
         if plan is not None and plan.action_type == "deliver" and self.logger:
-            self.logger.info(
-                "[Policy] frame=%s overriding with deliver id=%s name=%s dist=%.2f",
-                frame,
+                        self.logger.info(
+                            "[Policy] frame=%s overriding with deliver id=%s name=%s dist=%.2f",
+                            frame,
                 plan.target_id,
                 plan.meta.get("target_name", "?"),
                 plan.meta.get("distance", -1.0),
             )
         elif plan is None and holding_ids and self.logger:
-            self.logger.debug(
-                "[Policy] frame=%s _maybe_force_deliver returned None",
-                frame,
-            )
+                    self.logger.debug(
+                        "[Policy] frame=%s _maybe_force_deliver returned None",
+                        frame,
+                    )
         if plan is None or plan.action_type != "pick":
             if self.logger and visible_infos:
                 grabbable_count = sum(1 for info in visible_infos if info.get("is_grabbable"))
@@ -851,8 +1249,32 @@ class ViCoPolicy:
                 if override_plan is not None:
                     plan = override_plan
                     override_used = True
-                elif self.logger and visible_infos:
-                    self.logger.debug("[Policy] frame=%s force_pick returned None", frame)
+                elif self.logger:
+                    if visible_infos:
+                        self.logger.debug("[Policy] frame=%s force_pick returned None", frame)
+                    else:
+                        self.logger.debug("[Policy] frame=%s force_pick returned None (no visible_infos)", frame)
+                    # If force_pick returned None and no task_targets, try explore as fallback
+                    task_target_count = sum(1 for info in visible_infos if info.get("is_task_target")) if visible_infos else 0
+                    # Also check snapshot.team_symbolic for task_targets
+                    if task_target_count == 0 and snapshot and hasattr(snapshot, "team_symbolic") and snapshot.team_symbolic:
+                        for entry in snapshot.team_symbolic:
+                            if entry.get("is_task_target") and entry.get("is_grabbable"):
+                                task_target_count += 1
+                                break
+                    if task_target_count == 0 and not holding_ids:
+                        # No task targets and not holding anything - try explore
+                        if self.logger:
+                            self.logger.info(
+                                "[Policy] frame=%s force_pick returned None and task_targets=0 (visible_infos=%d), trying explore fallback",
+                                frame,
+                                len(visible_infos) if visible_infos else 0,
+                            )
+                        explore_plan = ReasonedPlan("search", None, None, 0.5, {"reason": "force_pick_none_no_task_targets", "fallback": "persist"})
+                        explore_plan = self._ensure_plan_target(explore_plan)
+                        if explore_plan.action_type != "idle":
+                            plan = explore_plan
+                            override_used = True
         if plan is None:
             plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "no_plan"})
         plan = self._ensure_plan_target(plan)
@@ -1011,13 +1433,13 @@ class ViCoPolicy:
                             if self.logger:
                                 self.logger.warning(
                                     "[Policy] target outside room and cannot clamp to valid position: %s -> %s (adding to skip_targets)",
-                                    target_pos,
+                                target_pos,
                                     clamped_pos if clamped_pos is not None else "None",
-                                )
-                            # Add to skip_targets to prevent LLM from suggesting it again
-                            self._register_skip_target(position=target_pos)
-                            plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "target_outside_room"})
-                            rejected = True
+                            )
+                        # Add to skip_targets to prevent LLM from suggesting it again
+                        self._register_skip_target(position=target_pos)
+                        plan = ReasonedPlan("idle", None, None, 0.0, {"reason": "target_outside_room"})
+                        rejected = True
         if plan.action_type != "idle" and guidance.source == "llm":
             self.last_reasoner_frame = frame
             if self.logger:
@@ -1075,13 +1497,97 @@ class ViCoPolicy:
                         )
                     return {"type": "ongoing"}
         
+        # Handle invalid_target_position or idle plan with fallback
+        if plan.action_type == "idle" and plan.meta.get("reason") in ("invalid_target_position", "llm_invalid_z_zero_position", "target_outside_room"):
+            # Count consecutive invalid_target_position rejections
+            invalid_pos_count = self.agent_state.get("invalid_target_position_count", 0) + 1
+            self.agent_state["invalid_target_position_count"] = invalid_pos_count
+            
+            # If invalid_target_position happens 5+ times, try fallback action
+            # Increased threshold to avoid interfering with normal pick/deliver operations
+            if invalid_pos_count >= 5:
+                if self.logger:
+                    self.logger.warning(
+                        "[Policy] frame=%s invalid_target_position rejected %d times, trying fallback explore",
+                        frame,
+                        invalid_pos_count,
+                    )
+                # Try explore as fallback
+                blocked_coords = self.agent_state.get("blocked_coords", set())
+                current_pos = obs.get("agent_position") or obs.get("position")
+                if current_pos:
+                    blocked_coords.add(tuple(current_pos[:2]))
+                    self.agent_state["blocked_coords"] = blocked_coords
+                
+                explore_plan = ReasonedPlan("search", None, None, 0.5, {"reason": "invalid_target_position_fallback", "fallback": "persist"})
+                explore_plan = self._ensure_plan_target(explore_plan)
+                
+                # If still idle, try random position
+                if explore_plan.action_type == "idle" and current_pos and invalid_pos_count >= 8:
+                    import random
+                    if hasattr(self, 'env_api') and self.env_api:
+                        room_bounds = self.env_api.get("room_bounds")
+                        if room_bounds:
+                            target_x = random.uniform(room_bounds[0][0], room_bounds[1][0])
+                            target_z = random.uniform(room_bounds[0][2], room_bounds[1][2])
+                            target_pos = (target_x, current_pos[1], target_z)
+                            explore_plan = ReasonedPlan("move", None, target_pos, 0.5, {"reason": "invalid_target_position_fallback", "fallback": "random_position"})
+                            if self.logger:
+                                self.logger.info(
+                                    "[Policy] frame=%s invalid_target_position %d times, moving to random position %s",
+                                    frame,
+                                    invalid_pos_count,
+                                    target_pos,
+                                )
+                
+                if explore_plan.action_type != "idle":
+                    command, exec_meta = self.executor.execute(explore_plan, snapshot, self.agent_state)
+                    self.agent_state.setdefault("recent_meta", []).append(exec_meta)
+                    # Reset invalid_target_position_count after executing fallback action
+                    self.agent_state["invalid_target_position_count"] = 0
+                    return command
+        else:
+            # Reset invalid_target_position_count if we have a valid plan
+            self.agent_state["invalid_target_position_count"] = 0
+        
         command, exec_meta = self.executor.execute(plan, snapshot, self.agent_state)
         self.agent_state.setdefault("recent_meta", []).append(exec_meta)
         command_type = command.get("type") if isinstance(command, dict) else None
+        
+        # Helper function to check if object_id is a task target
+        # Use plan.meta.get("is_task_target") first, then check visible_infos and snapshot
+        def is_task_target_id(obj_id, plan_meta, visible_infos, snapshot):
+            # First check plan.meta (most reliable, set by policy)
+            if plan_meta and plan_meta.get("is_task_target", False):
+                return True
+            # Then check visible_infos
+            if visible_infos:
+                for info in visible_infos:
+                    if info.get("id") == obj_id:
+                        return info.get("is_task_target", False)
+            # Finally check snapshot.team_symbolic
+            if snapshot and hasattr(snapshot, "team_symbolic") and snapshot.team_symbolic:
+                for entry in snapshot.team_symbolic:
+                    if entry.get("id") == obj_id:
+                        return entry.get("is_task_target", False)
+            return False
+        
+        plan_meta = plan.meta if isinstance(plan.meta, dict) else {}
+        
         if command_type == 3:
-            self.agent_state["last_command"] = "pick"
-            self.agent_state["last_pick_id"] = command.get("object", plan.target_id)
-            self.agent_state["last_pick_pos"] = plan.target_position
+            pick_id = command.get("object", plan.target_id)
+            # Only store last_pick_id if it's a task target
+            if pick_id is not None:
+                if is_task_target_id(pick_id, plan_meta, visible_infos, snapshot):
+                    self.agent_state["last_command"] = "pick"
+                    self.agent_state["last_pick_id"] = pick_id
+                    self.agent_state["last_pick_pos"] = plan.target_position
+                else:
+                    if self.logger:
+                        self.logger.debug(
+                            "[Policy] not storing last_pick_id=%s (not a task target)",
+                            pick_id,
+                        )
         elif command_type == 4:
             self.agent_state["last_command"] = "deliver"
             self.agent_state["last_deliver_id"] = plan.target_id
@@ -1091,22 +1597,36 @@ class ViCoPolicy:
             self.agent_state["last_command"] = "continuous_move"
             # Navigation 시작 프레임 기록 (ongoing이 너무 오래 지속되는지 확인하기 위해)
             self.agent_state["last_nav_start_frame"] = frame
-            # Pick을 위한 navigation인 경우 last_pick_id 저장
+            # Pick을 위한 navigation인 경우 last_pick_id 저장 (task target인 경우만)
             if plan.action_type == "pick" and plan.target_id is not None:
-                self.agent_state["last_pick_id"] = plan.target_id
-                self.agent_state["last_pick_pos"] = plan.target_position
+                if is_task_target_id(plan.target_id, plan_meta, visible_infos, snapshot):
+                    self.agent_state["last_pick_id"] = plan.target_id
+                    self.agent_state["last_pick_pos"] = plan.target_position
+                else:
+                    if self.logger:
+                        self.logger.debug(
+                            "[Policy] not storing last_pick_id=%s for navigation (not a task target)",
+                            plan.target_id,
+                        )
         elif command_type not in (None, "ongoing"):
             self.agent_state["last_command"] = str(command_type)
-        # If pick action resulted in navigation (too_far_for_pick), store pick_id for retry after navigation
+        # If pick action resulted in navigation (too_far_for_pick), store pick_id for retry after navigation (task target인 경우만)
         if plan.action_type == "pick" and exec_meta.get("reason") == "too_far_for_pick":
             if plan.target_id is not None:
-                self.agent_state["last_pick_id"] = plan.target_id
-                self.agent_state["last_pick_pos"] = plan.target_position
-                if self.logger:
-                    self.logger.debug(
-                        "[Policy] storing last_pick_id=%s for retry after navigation (too_far_for_pick)",
-                        plan.target_id,
-                    )
+                if is_task_target_id(plan.target_id, plan_meta, visible_infos, snapshot):
+                    self.agent_state["last_pick_id"] = plan.target_id
+                    self.agent_state["last_pick_pos"] = plan.target_position
+                    if self.logger:
+                        self.logger.debug(
+                            "[Policy] storing last_pick_id=%s for retry after navigation (too_far_for_pick, is_task_target=True)",
+                            plan.target_id,
+                        )
+                else:
+                    if self.logger:
+                        self.logger.debug(
+                            "[Policy] not storing last_pick_id=%s for retry (not a task target)",
+                            plan.target_id,
+                        )
         if exec_meta.get("forced_failure"):
             target = plan.target_position
             name = plan.meta.get("target_name") if isinstance(plan.meta, dict) else None
@@ -1209,16 +1729,8 @@ class ViCoPolicy:
                     has_obs = hasattr(self.agent_memory, "obs") and self.agent_memory.obs is not None
                     has_cal_method = self.agent_memory is not None and hasattr(self.agent_memory, "cal_object_position")
                     
-                    # Always log to understand why cal_object_position is not being called
-                    if self.logger:
-                        self.logger.info(
-                            "[Policy] _prepare_perception_inputs: position=None for id=%s name=%s has_seg_color=%s has_obs=%s has_cal_method=%s",
-                            obj_id,
-                            obj_name,
-                            has_seg_color,
-                            has_obs,
-                            has_cal_method,
-                        )
+                    # Removed verbose logging - too noisy (was logging 2000+ times per run)
+                    # If needed for debugging, use DEBUG level instead
                     
                     if has_cal_method and has_seg_color and has_obs:
                         try:
@@ -1351,15 +1863,25 @@ class ViCoPolicy:
             )
         valid_held_objects = False
         actual_held_ids = []
+        # Get verification_removed_ids to filter out objects that were already delivered
+        verification_removed_ids = self.agent_state.get("verification_removed_ids", set())
         for entry in held_objects:
             if not entry:
                 continue
             obj_id = entry.get("id")
             arm_name = entry.get("arm")
             if obj_id is not None:
-                holding_ids.append(obj_id)
-                actual_held_ids.append(obj_id)
-                valid_held_objects = True
+                # Skip objects that were already delivered (in verification_removed_ids)
+                # This prevents re-adding objects to holding_ids after successful delivery
+                if obj_id not in verification_removed_ids:
+                    holding_ids.append(obj_id)
+                    actual_held_ids.append(obj_id)
+                    valid_held_objects = True
+                elif self.logger:
+                    self.logger.debug(
+                        "[Policy] _update_agent_state: skipping object_id=%d in held_objects (already delivered, in verification_removed_ids)",
+                        obj_id,
+                    )
             if isinstance(arm_name, str):
                 holding_slots[arm_name.lower()] = obj_id
         
@@ -1458,7 +1980,35 @@ class ViCoPolicy:
         previous_holding_ids = self.agent_state.get("holding_ids", [])
         put_in_success = False
         
-        if last_command == "deliver":
+        # Check if put_in was successful from obs (TDW reports this directly)
+        # put_in_success is a tuple (padded to length 10), filter out zeros (invalid object_ids)
+        put_in_success_raw = obs.get("put_in_success", [])
+        if isinstance(put_in_success_raw, (tuple, list)):
+            put_in_success_ids = [obj_id for obj_id in put_in_success_raw if obj_id != 0 and obj_id is not None]
+        else:
+            put_in_success_ids = []
+        if put_in_success_ids:
+            # TDW reported put_in success for these objects
+            if previous_holding_ids:
+                # Check if any previous holding_ids objects are in put_in_success_ids
+                if any(hid in put_in_success_ids for hid in previous_holding_ids):
+                    put_in_success = True
+            if self.logger:
+                self.logger.info(
+                            "[Policy] deliver success: TDW reported put_in_success for objects %s (previous holding_ids=%s)",
+                            put_in_success_ids,
+                            previous_holding_ids,
+                        )
+            else:
+                # Even if no previous_holding_ids, if TDW reports success, treat as success
+                put_in_success = True
+                if self.logger:
+                    self.logger.info(
+                        "[Policy] deliver success: TDW reported put_in_success for objects %s (no previous holding_ids)",
+                        put_in_success_ids,
+                    )
+        
+        if not put_in_success and last_command == "deliver":
             # Check if put_in was successful by comparing held_objects
             # If previous holding_ids objects are no longer in held_objects, put_in was successful
             if previous_holding_ids:
@@ -1498,9 +2048,40 @@ class ViCoPolicy:
                 # Keep only objects that are actually still in held_objects AND were not in previous_holding_ids
                 # This removes all delivered objects from holding_ids
                 holding_ids = [hid for hid in actual_held_ids if hid not in previous_holding_ids]
+                
+                # CRITICAL: Add delivered objects to verification_removed_ids to prevent them from being re-added
+                # This is necessary because TDW may still show them in held_objects for several frames after delivery
+                verification_removed_set = self.agent_state.get("verification_removed_ids", set())
+                verification_removed_set.update(previous_holding_ids)
+                self.agent_state["verification_removed_ids"] = verification_removed_set
+                
+                # CRITICAL: Add delivered objects to skip_targets to prevent them from being picked up again
+                # This prevents the policy from trying to pick up objects that have already been delivered
+                # Use object_id instead of name to avoid skipping other objects with the same name
+                for delivered_id in previous_holding_ids:
+                    # Register by object_id (not name) to avoid skipping other objects with the same name
+                    self._register_skip_target(object_id=delivered_id)
+                    if self.logger:
+                        # Try to get object name for logging
+                        obj_name = None
+                        if self.agent_memory and hasattr(self.agent_memory, "object_info"):
+                            obj_info = self.agent_memory.object_info.get(delivered_id)
+                            if obj_info:
+                                obj_name = obj_info.get("name")
+                        if not obj_name and held_objects:
+                            for entry in held_objects:
+                                if entry and entry.get("id") == delivered_id:
+                                    obj_name = entry.get("name")
+                                    break
+                        self.logger.info(
+                            "[Policy] deliver success: added delivered object to skip_targets id=%s name=%s (using object_id to avoid skipping other objects with same name)",
+                            delivered_id,
+                            obj_name or "unknown",
+                        )
+                
                 if self.logger:
                     self.logger.info(
-                        "[Policy] deliver success: removed delivered objects from holding_ids (was %s, removed %s, now %s)",
+                        "[Policy] deliver success: removed delivered objects from holding_ids (was %s, removed %s, now %s, added to verification_removed_ids)",
                         previous_holding_ids,
                         previous_holding_ids,
                         holding_ids,
@@ -1542,10 +2123,10 @@ class ViCoPolicy:
                     if preserve_frame < 0:
                         # First time preserving, record the frame
                         self.agent_state["holding_ids_preserve_frame"] = current_frame
-                    if self.logger:
-                        self.logger.debug(
+                if self.logger:
+                    self.logger.debug(
                             "[Policy] _update_agent_state: held_objects empty, preserving existing holding_ids=%s (preserve_frame=%d, current_frame=%d)",
-                            holding_ids,
+                        holding_ids,
                             preserve_frame,
                             current_frame,
                         )
@@ -1582,6 +2163,17 @@ class ViCoPolicy:
 
         skip_coords = self._skip_coords()
         guard_coords = set(self.agent_state.get("nav_guard_coords", set()) or [])
+        # Also get guard_skip from executor to avoid recently blocked positions
+        executor_guard_skip = {}
+        if hasattr(self.executor, "_guard_skip"):
+            executor_guard_skip = self.executor._guard_skip
+            # Add guard_skip positions to blocked_coords
+            for key, value in executor_guard_skip.items():
+                if value.get("frames", 0) > 0:
+                    # key is (x*10, z*10), convert back to actual coordinates
+                    guard_x = key[0] / 10.0
+                    guard_z = key[1] / 10.0 if len(key) > 1 else 0.0
+                    guard_coords.add((guard_x, guard_z))
         blocked_coords = skip_coords | guard_coords
 
         def _to_array(value):
@@ -1646,10 +2238,10 @@ class ViCoPolicy:
             return plan
         if self.agent_memory is None:
             return plan
-        # 방안 2: explore() 재시도 로직 개선 (10회 → 20회)
+        # 방안 2: explore() 재시도 로직 개선 (10회 → 30회, guard에 막힌 위치 피하기)
         try:
             attempts = 0
-            max_attempts = 20  # 10회에서 20회로 증가
+            max_attempts = 30  # 20회에서 30회로 증가 (guard에 막힌 위치가 많을 수 있음)
             while True:
                 explore_x, explore_z = self.agent_memory.explore()
                 candidate_pos = (float(explore_x), 0.0, float(explore_z))
@@ -1673,7 +2265,16 @@ class ViCoPolicy:
                         if (x_min is not None and x_max is not None and (explore_x < x_min or explore_x > x_max)) or \
                            (z_min is not None and z_max is not None and (explore_z < z_min or explore_z > z_max)):
                             is_valid = False
-                if (not is_zero_pos and not self._is_blocked_position(candidate_pos, blocked_coords) and is_valid) or attempts >= max_attempts:
+                # Check if position is blocked (including guard_skip positions)
+                is_blocked = self._is_blocked_position(candidate_pos, blocked_coords)
+                if (not is_zero_pos and not is_blocked and is_valid) or attempts >= max_attempts:
+                    if attempts >= max_attempts and self.logger:
+                        self.logger.warning(
+                            "[Policy] explore() reached max_attempts=%d, using last candidate even if blocked: (%s, %s)",
+                            max_attempts,
+                            explore_x,
+                            explore_z,
+                        )
                     break
                 attempts += 1
         except Exception as exc:  # pragma: no cover
@@ -1822,16 +2423,20 @@ class ViCoPolicy:
         return ReasonedPlan(action_type="move", target_id=None, target_position=target_pos, confidence=max(plan.confidence, 0.3), meta=meta)
 
     # ------------------------------------------------------------------
-    def _register_skip_target(self, name: Optional[str] = None, position: Optional[Tuple[float, float, float]] = None) -> None:
-        store = self.agent_state.setdefault("skip_targets", {"names": set(), "coords": set()})
+    def _register_skip_target(self, name: Optional[str] = None, position: Optional[Tuple[float, float, float]] = None, object_id: Optional[int] = None) -> None:
+        store = self.agent_state.setdefault("skip_targets", {"names": set(), "coords": set(), "ids": set()})
         names_set = store.setdefault("names", set())
         coords_set = store.setdefault("coords", set())
+        ids_set = store.setdefault("ids", set())
         if name:
             names_set.add(str(name).lower())
         if position is not None:
             coords_set.add(self._coord_key(position))
+        if object_id is not None:
+            ids_set.add(int(object_id))
         store["names"] = names_set
         store["coords"] = coords_set
+        store["ids"] = ids_set
         self.agent_state["skip_targets"] = store
         if self.team_hub is not None:
             self.team_hub.update_skip_targets(self.agent_id, names_set, coords_set)
@@ -1937,6 +2542,7 @@ class ViCoPolicy:
             str(name).lower()
             for name in self.agent_state.get("skip_targets", {}).get("names", set())
         }
+        skip_ids = self.agent_state.get("skip_targets", {}).get("ids", set())
         # Get holding_ids to exclude already held objects
         holding_ids = set(self.agent_state.get("holding_ids", []))
         # Note: Task target assignment to closest agent is already done in act() before calling this function
@@ -2180,10 +2786,19 @@ class ViCoPolicy:
             if position is not None and self._is_blocked_position(position, blocked_coords, radius=0.4):
                 filtered_reasons["blocked"] = filtered_reasons.get("blocked", 0) + 1
                 continue
-            name_lc = str(info.get("name", "")).lower()
-            if name_lc in skip_names:
-                filtered_reasons["skip_name"] = filtered_reasons.get("skip_name", 0) + 1
+            # Check skip_ids first (more specific - only skips the exact object that was delivered)
+            if obj_id is not None and obj_id in skip_ids:
+                filtered_reasons["skip_id"] = filtered_reasons.get("skip_id", 0) + 1
                 continue
+            # Check skip_names (less specific - skips all objects with the same name)
+            # BUT: Skip this check for task targets - we may need to pick other objects with the same name
+            # Only skip by name if it's NOT a task target (task targets are allowed even if same name was delivered before)
+            is_task_target = info.get("is_task_target", False)
+            if not is_task_target:
+                name_lc = str(info.get("name", "")).lower()
+                if name_lc in skip_names:
+                    filtered_reasons["skip_name"] = filtered_reasons.get("skip_name", 0) + 1
+                    continue
             # Note: Task target assignment is already done in act() - only objects assigned to this agent are passed in
             priority = info.get("priority", 0.0)
             if info.get("is_task_target"):
@@ -2254,14 +2869,14 @@ class ViCoPolicy:
                                     
                                     if is_in_room:
                                         target_pos = estimated_pos
-                                        if self.logger:
-                                            self.logger.info(
-                                                "[Policy] _maybe_force_pick: estimated position for task target id=%s name=%s dist=%.2f pos=%s",
-                                                target_id,
-                                                best_info.get("name"),
-                                                distance,
-                                                target_pos,
-                                            )
+                                    if self.logger:
+                                        self.logger.info(
+                                            "[Policy] _maybe_force_pick: estimated position for task target id=%s name=%s dist=%.2f pos=%s",
+                                            target_id,
+                                            best_info.get("name"),
+                                            distance,
+                                            target_pos,
+                                        )
                                     else:
                                         # Estimated position is outside room - don't use it, will use object_id only
                                         if self.logger:
@@ -2584,10 +3199,175 @@ class ViCoPolicy:
                                         distance,
                                         max_distance,
                                     )
+                # 핵심 수정: goal_position_id가 있으면 항상 container_candidates에 추가 (최우선)
+                # goal_position_id가 memory에 없어도 env_api에서 위치를 가져올 수 있음
+                if goal_position_id is not None:
+                    # Check if goal_position_id is already in container_candidates
+                    goal_in_candidates = any(cid == goal_position_id for _, cid, _, _ in container_candidates)
+                    if not goal_in_candidates:
+                        # Try to find goal_position_id in memory
+                        goal_obj_info = None
+                        goal_pos = None
+                        goal_name = "goal_position"
+                        for obj_id, obj_info in getattr(self.agent_memory, "object_info", {}).items():
+                            if obj_id == goal_position_id:
+                                goal_obj_info = obj_info
+                                goal_pos = self._normalise_position(obj_info.get("position"))
+                                goal_name = str(obj_info.get("name", "goal_position"))
+                                break
+                        
+                        # Try to get position from env_api if not in memory
+                        if goal_pos is None and self.env_api is not None:
+                            # Try to get position from env_api using get_goal_position function
+                            try:
+                                if isinstance(self.env_api, dict):
+                                    # First try get_goal_position (most direct)
+                                    if "get_goal_position" in self.env_api:
+                                        goal_pos = self.env_api["get_goal_position"]()
+                                        if goal_pos is not None:
+                                            goal_pos = self._normalise_position(goal_pos)
+                                            if self.logger:
+                                                self.logger.info(
+                                                    "[Policy] _maybe_force_deliver: got goal_position_id=%s position from env_api.get_goal_position: %s",
+                                                    goal_position_id,
+                                                    goal_pos,
+                                                )
+                                    # Fallback: try get_object_list
+                                    elif "get_object_list" in self.env_api:
+                                        obj_list = self.env_api["get_object_list"]()
+                                        for obj in obj_list:
+                                            if obj.get("id") == goal_position_id:
+                                                goal_pos = self._normalise_position(obj.get("position"))
+                                                goal_name = str(obj.get("name", "goal_position"))
+                                                break
+                                elif hasattr(self.env_api, "get_goal_position"):
+                                    goal_pos = self.env_api.get_goal_position()
+                                    if goal_pos is not None:
+                                        goal_pos = self._normalise_position(goal_pos)
+                                        if self.logger:
+                                            self.logger.info(
+                                                "[Policy] _maybe_force_deliver: got goal_position_id=%s position from env_api.get_goal_position: %s",
+                                                goal_position_id,
+                                                goal_pos,
+                                            )
+                                elif hasattr(self.env_api, "get_object_list"):
+                                    obj_list = self.env_api.get_object_list()
+                                    for obj in obj_list:
+                                        if obj.get("id") == goal_position_id:
+                                            goal_pos = self._normalise_position(obj.get("position"))
+                                            goal_name = str(obj.get("name", "goal_position"))
+                                            break
+                            except Exception as exc:
+                                if self.logger:
+                                    self.logger.debug(
+                                        "[Policy] _maybe_force_deliver: failed to get goal_position_id position from env_api: %s",
+                                        exc,
+                                    )
+                        
+                        # Add goal_position_id to candidates with highest priority (distance = -1)
+                        # Even if position is None, add it with a placeholder position (will use env_api position later)
+                        if goal_pos is not None:
+                            try:
+                                pos_arr = np.asarray(goal_pos, dtype=np.float32)
+                                if pos_arr.shape[0] >= 3 and agent_pos.shape[0] >= 3:
+                                    goal_distance = float(np.linalg.norm(agent_pos[[0, 2]] - pos_arr[[0, 2]]))
+                                else:
+                                    goal_distance = float(np.linalg.norm(agent_pos - pos_arr))
+                                # Add goal_position_id with negative distance to ensure it's selected first
+                                container_candidates.insert(0, (-1.0, goal_position_id, goal_pos, goal_name))
+                                if self.logger:
+                                    self.logger.info(
+                                        "[Policy] _maybe_force_deliver: added goal_position_id=%s name=%s to candidates (dist=%.2f, priority=-1.0)",
+                                        goal_position_id,
+                                        goal_name,
+                                        goal_distance,
+                                    )
+                            except Exception:
+                                pass
+                        else:
+                            # Position not found, but still add goal_position_id with highest priority
+                            # Use agent position as placeholder (will be updated from env_api later)
+                            placeholder_pos = tuple(agent_pos) if agent_pos is not None else (0.0, 0.0, 0.0)
+                            container_candidates.insert(0, (-1.0, goal_position_id, placeholder_pos, goal_name))
+                            if self.logger:
+                                self.logger.warning(
+                                    "[Policy] _maybe_force_deliver: goal_position_id=%s position not found, added with placeholder pos=%s (priority=-1.0, will use env_api position)",
+                                    goal_position_id,
+                                    placeholder_pos,
+                                )
+                
                 if container_candidates:
-                    # Sort by distance and pick the closest one
+                    # PRIORITY: If goal_position_id is in candidates, always select it first
+                    # Sort by distance (negative distance = goal_position_id = highest priority)
                     container_candidates.sort(key=lambda x: x[0])
+                    
+                    # 핵심 수정: goal_position_id가 있으면 항상 최우선 선택 (거리 무관)
+                    # Sort 후에도 goal_position_id가 첫 번째가 아닐 수 있으므로 명시적으로 체크
                     best_distance, best_id, best_pos, best_name = container_candidates[0]
+                    
+                    # If goal_position_id exists and is in candidates, always select it first (regardless of distance)
+                    if goal_position_id is not None:
+                        # Find goal_position_id in candidates
+                        for dist, cid, cpos, cname in container_candidates:
+                            if cid == goal_position_id:
+                                best_distance, best_id, best_pos, best_name = dist, cid, cpos, cname
+                                if self.logger:
+                                    self.logger.info(
+                                        "[Policy] _maybe_force_deliver: selecting goal_position_id=%s name=%s (highest priority, ignoring distance)",
+                                        best_id,
+                                        best_name,
+                                    )
+                                break
+                    
+                    # If best_id is goal_position_id (distance = -1), recalculate actual distance for logging
+                    if best_id == goal_position_id and best_distance < 0:
+                        # Try to get actual position from env_api if placeholder was used
+                        if best_pos == (0.0, 0.0, 0.0) or (agent_pos is not None and np.allclose(best_pos, agent_pos)):
+                            # Placeholder position was used, try to get real position from env_api
+                            try:
+                                if isinstance(self.env_api, dict):
+                                    # First try get_goal_position (most direct)
+                                    if "get_goal_position" in self.env_api:
+                                        real_pos = self.env_api["get_goal_position"]()
+                                        if real_pos is not None:
+                                            real_pos = self._normalise_position(real_pos)
+                                            if real_pos is not None:
+                                                best_pos = real_pos
+                                    # Fallback: try get_object_list
+                                    elif "get_object_list" in self.env_api:
+                                        obj_list = self.env_api["get_object_list"]()
+                                        for obj in obj_list:
+                                            if obj.get("id") == goal_position_id:
+                                                real_pos = self._normalise_position(obj.get("position"))
+                                                if real_pos is not None:
+                                                    best_pos = real_pos
+                                                    break
+                                elif hasattr(self.env_api, "get_goal_position"):
+                                    real_pos = self.env_api.get_goal_position()
+                                    if real_pos is not None:
+                                        real_pos = self._normalise_position(real_pos)
+                                        if real_pos is not None:
+                                            best_pos = real_pos
+                                elif hasattr(self.env_api, "get_object_list"):
+                                    obj_list = self.env_api.get_object_list()
+                                    for obj in obj_list:
+                                        if obj.get("id") == goal_position_id:
+                                            real_pos = self._normalise_position(obj.get("position"))
+                                            if real_pos is not None:
+                                                best_pos = real_pos
+                                                break
+                            except Exception:
+                                pass
+                        
+                        try:
+                            pos_arr = np.asarray(best_pos, dtype=np.float32)
+                            if pos_arr.shape[0] >= 3 and agent_pos.shape[0] >= 3:
+                                actual_distance = float(np.linalg.norm(agent_pos[[0, 2]] - pos_arr[[0, 2]]))
+                            else:
+                                actual_distance = float(np.linalg.norm(agent_pos - pos_arr))
+                            best_distance = actual_distance
+                        except Exception:
+                            best_distance = 999.0
                     
                     # If this is goal_position_id, try to get actual position from env_api if available
                     if goal_position_id is not None and best_id == goal_position_id:
@@ -2647,34 +3427,34 @@ class ViCoPolicy:
                                         exc,
                                     )
                     
-                    if goal_pos is not None:
-                        goal_pos = self._normalise_position(goal_pos)
                         if goal_pos is not None:
-                            try:
-                                pos_arr = np.asarray(goal_pos, dtype=np.float32)
-                                if pos_arr.shape[0] >= 3 and agent_pos.shape[0] >= 3:
-                                    goal_distance = float(np.linalg.norm(agent_pos[[0, 2]] - pos_arr[[0, 2]]))
-                                else:
-                                    goal_distance = float(np.linalg.norm(agent_pos - pos_arr))
-                            except Exception:
-                                goal_distance = 999.0
+                            goal_pos = self._normalise_position(goal_pos)
+                            if goal_pos is not None:
+                                try:
+                                    pos_arr = np.asarray(goal_pos, dtype=np.float32)
+                                    if pos_arr.shape[0] >= 3 and agent_pos.shape[0] >= 3:
+                                        goal_distance = float(np.linalg.norm(agent_pos[[0, 2]] - pos_arr[[0, 2]]))
+                                    else:
+                                        goal_distance = float(np.linalg.norm(agent_pos - pos_arr))
+                                except Exception:
+                                    goal_distance = 999.0
                             
                             # Always return deliver plan for goal_position_id (no distance limit)
                             # The executor will handle navigation if needed
-                            if self.logger:
-                                self.logger.info(
+                                if self.logger:
+                                    self.logger.info(
                                     "[Policy] _maybe_force_deliver: overriding with deliver to goal_position_id=%s (name=%s) dist=%.2f pos=%s",
-                                    goal_position_id,
-                                    goal_name,
-                                    goal_distance,
+                                        goal_position_id,
+                                        goal_name,
+                                        goal_distance,
                                     goal_pos,
-                                )
-                            meta = {
+                                    )
+                                meta = {
                                 "reason": "policy_override_deliver_goal",
-                                "target_name": goal_name,
-                                "distance": goal_distance,
-                                "is_goal_position": True,
-                            }
+                                    "target_name": goal_name,
+                                    "distance": goal_distance,
+                                    "is_goal_position": True,
+                                }
                             return ReasonedPlan("deliver", goal_position_id, goal_pos, 0.95, meta)
                         elif self.logger:
                             self.logger.warning(
@@ -2694,8 +3474,9 @@ class ViCoPolicy:
                         list(task_container_names),
                         sample_names,
                     )
-        skip_targets = self.agent_state.get("skip_targets", {"names": set(), "coords": set()})
+        skip_targets = self.agent_state.get("skip_targets", {"names": set(), "coords": set(), "ids": set()})
         skip_names = {str(n).lower() for n in skip_targets.get("names", [])}
+        skip_ids = skip_targets.get("ids", set())
         blocked_coords = set()
         for coord in skip_targets.get("coords", []):
             if isinstance(coord, (list, tuple)) and len(coord) >= 2:
@@ -2762,6 +3543,11 @@ class ViCoPolicy:
             if self._is_blocked_position(position, blocked_coords, radius=0.4):
                 filtered_reasons["blocked"] = filtered_reasons.get("blocked", 0) + 1
                 continue
+            # Check skip_ids first (more specific - only skips the exact container that was used)
+            if container_id is not None and container_id in skip_ids:
+                filtered_reasons["skip_id"] = filtered_reasons.get("skip_id", 0) + 1
+                continue
+            # Check skip_names (less specific - skips all containers with the same name)
             name_lc = str(info.get("name", "")).lower()
             if name_lc in skip_names:
                 filtered_reasons["skip_name"] = filtered_reasons.get("skip_name", 0) + 1
