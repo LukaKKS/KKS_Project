@@ -1,0 +1,54 @@
+{
+  "title": "ViCo-Lite efficiency experiments final",
+  "experiment_1": {
+    "description": "호출 횟수 + 지연 시간 (전체)",
+    "per_episode": {
+      "total_calls": 4464,
+      "total_latency_ms": 90765,
+      "total_latency_sec": 90.8
+    },
+    "per_step_avg_latency_ms": 146
+  },
+  "experiment_2": {
+    "description": "모듈별 호출 횟수 + 지연 시간",
+    "latency_per_call_ms": {
+      "full_perception": 72.61,
+      "clip_image_encode": 43.08,
+      "clip_text_encode": 25.93,
+      "ema_memory_update": 0.012,
+      "team_hub_update": 0.037,
+      "heuristic_scoring": 0.066,
+      "astar_240x240": 4.91
+    },
+    "per_episode": {
+      "calls": {
+        "full_perception": 1240,
+        "ema_memory_update": 1240,
+        "team_hub_update": 620,
+        "heuristic_scoring": 1240,
+        "astar_240x240": 124
+      },
+      "latency_ms": {
+        "full_perception": 90036,
+        "ema_memory_update": 15,
+        "team_hub_update": 23,
+        "heuristic_scoring": 82,
+        "astar_240x240": 609
+      },
+      "total_latency_ms": 90765
+    },
+    "per_step_calls": {
+      "full_perception": 2,
+      "ema_memory_update": 2,
+      "team_hub_update": 1,
+      "heuristic_scoring": 2,
+      "astar_240x240": 0.2
+    }
+  },
+  "source": {
+    "avg_steps_per_episode": 620,
+    "n_agents": 2,
+    "benchmark": "01_computational_cost/benchmark_results.json",
+    "steps_from": "02_ablation logs (12 episodes)"
+  }
+}

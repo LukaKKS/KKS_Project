@@ -1,0 +1,64 @@
+% Wall-Clock Timing
+\begin{table}[t]
+\centering
+\caption{Wall-clock latency of ViCo-Lite components (ms). Measured on CPU over 100 runs.}
+\label{tab:wallclock}
+\begin{tabular}{lcccc}
+\toprule
+\textbf{Component} & \textbf{Mean} & \textbf{Std} & \textbf{P95} & \textbf{Per-step \%} \\
+\midrule
+CLIP Image Enc. & 43.08 & 5.73 & 48.90 & 30.4\% \\
+CLIP Text Enc. & 25.93 & 1.87 & 29.33 & 18.3\% \\
+EMA Update & 0.01 & 0.00 & 0.02 & 0.0\% \\
+Team Hub Update & 0.04 & 0.01 & 0.04 & 0.0\% \\
+Heuristic Scoring & 0.07 & 0.00 & 0.07 & 0.0\% \\
+Full Perception & 72.61 & 5.24 & 81.91 & 51.2\% \\
+A* (120x120) & 1.20 & 0.19 & 1.65 & 0.8\% \\
+A* (240x240) & 4.91 & 0.18 & 5.28 & 3.5\% \\
+A* (480x480) & 29.53 & 0.73 & 31.02 & 20.8\% \\
+\midrule
+\textbf{Total (per step)} & \textbf{141.73} & -- & -- & 100\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% FLOPs Comparison
+\begin{table}[t]
+\centering
+\caption{Computational cost (FLOPs) of ViCo-Lite components per decision step. ViCo-Lite's total cost is dominated by CLIP forward passes, while memory and planning operations are negligible.}
+\label{tab:flops}
+\begin{tabular}{lcc}
+\toprule
+\textbf{Component} & \textbf{FLOPs} & \textbf{GFLOPs} \\
+\midrule
+CLIP Image Encoder & 8,774,443,008 & 8.774 \\
+CLIP Text Encoder & 5,890,024,448 & 5.890 \\
+EMA Memory Update & 3,072 & $\sim$0 \\
+Heuristic Scoring & 150 & $\sim$0 \\
+A* Pathfinding (240$\times$240) & 3,643,495 & $\sim$0 \\
+\midrule
+\textbf{Total per step} & -- & \textbf{14.664} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+% Method Comparison
+\begin{table}[t]
+\centering
+\caption{Per-step computational cost comparison. LLM-based methods incur API latency and token costs per decision, while ViCo-Lite uses local inference only.}
+\label{tab:cost_comparison}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Method} & \textbf{LLM Calls} & \textbf{Latency} & \textbf{GPU GFLOPs} & \textbf{API Cost} & \textbf{Deterministic} \\
+\midrule
+CoTS (GPT-4) & Every step & 1--5s & N/A (API) & \$\$\$ & No \\
+CoELA (GPT-4) & Every step & 1--3s & N/A (API) & \$\$ & No \\
+LLM-based (GPT-4o-mini) & Periodic & 0.5--2s & N/A (API) & \$ & No \\
+\midrule
+ViCo-Lite (heuristic) & None & $<$50ms & $\sim$5 & \$0 & Yes \\
+ViCo-Lite (hybrid) & Periodic & $<$100ms$^*$ & $\sim$5 & \$0.01 & Partial \\
+\bottomrule
+\multicolumn{6}{l}{\footnotesize $^*$ Excludes optional LLM guidance call latency (controlled by \texttt{llm\_min\_interval}).} \\
+\end{tabular}
+\end{table}
+

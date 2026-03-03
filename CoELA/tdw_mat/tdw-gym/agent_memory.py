@@ -365,28 +365,109 @@ class AgentMemory():
         try:
             seg_color = o_dict['seg_color']
             pc = self.get_pc(seg_color)
-            # COELA-style: Require at least 5 points for reliable position calculation
-            # Single points or very few points lead to inaccurate positions, especially at long distances
-            if pc is None or pc.shape[1] < 5:
-                # Log why it failed (only once per object per frame to reduce log spam)
-                obj_id = o_dict.get('id')
+            obj_id = o_dict.get('id')
+            current_frame = self.obs.get('current_frames', 0) if hasattr(self, 'obs') and self.obs is not None else 0
+            
+            # 방법 2: 포인트 수 요구사항 완화 - 3-4개 포인트도 허용 (낮은 신뢰도)
+            # 방법 3: 이전 위치 정보 활용 - agent_memory에 이전 위치 저장 및 활용
+            # 방법 4: Multi-frame 위치 추정 - 여러 프레임의 위치 정보 누적
+            
+            # 포인트 수에 따라 신뢰도 조정
+            confidence = 1.0
+            if pc is None or pc.shape[1] < 3:
+                # 3개 미만: 실패
                 if hasattr(self, 'logger') and self.logger:
-                    # Use a cache to log each object only once per frame
                     if not hasattr(self, '_logged_failed_objects'):
                         self._logged_failed_objects = set()
                     if obj_id not in self._logged_failed_objects:
                         self.logger.debug(
-                            "[AgentMemory] cal_object_position failed: id=%s name=%s pc_shape=%s (need at least 5 points, COELA-style)",
+                            "[AgentMemory] cal_object_position failed: id=%s name=%s pc_shape=%s (need at least 3 points)",
                             obj_id,
                             o_dict.get('name'),
                             pc.shape if pc is not None else None,
                         )
                         self._logged_failed_objects.add(obj_id)
-                return None, None
+                
+                # 방법 3: 이전 위치 정보 활용 (fallback)
+                if obj_id is not None and hasattr(self, 'object_info') and obj_id in self.object_info:
+                    cached_info = self.object_info[obj_id]
+                    last_known_position = cached_info.get('last_known_position')
+                    last_seen_frame = cached_info.get('last_seen_frame', 0)
+                    # TTL 체크: 100프레임 이내의 위치만 사용
+                    if last_known_position is not None and current_frame - last_seen_frame < 100:
+                        if hasattr(self, 'logger') and self.logger:
+                            self.logger.debug(
+                                "[AgentMemory] cal_object_position: using cached position for id=%s (last_seen_frame=%d, current_frame=%d, age=%d)",
+                                obj_id,
+                                last_seen_frame,
+                                current_frame,
+                                current_frame - last_seen_frame,
+                            )
+                        # 낮은 신뢰도로 반환
+                        return last_known_position, None, 0.5
+                
+                return None, None, 0.0
+            elif pc.shape[1] < 5:
+                # 3-4개 포인트: 낮은 신뢰도로 허용
+                confidence = 0.5
+                if hasattr(self, 'logger') and self.logger:
+                    if not hasattr(self, '_logged_low_confidence_objects'):
+                        self._logged_low_confidence_objects = set()
+                    if obj_id not in self._logged_low_confidence_objects:
+                        self.logger.debug(
+                            "[AgentMemory] cal_object_position: low confidence (3-4 points) for id=%s name=%s pc_shape=%s",
+                            obj_id,
+                            o_dict.get('name'),
+                            pc.shape,
+                        )
+                        self._logged_low_confidence_objects.add(obj_id)
             
-            # Calculate position using mean (COELA-style)
+            # 방법 4: Multi-frame 위치 추정
+            # 여러 프레임의 위치 정보를 누적하여 추정
+            position_history = []
+            if obj_id is not None and hasattr(self, 'object_info') and obj_id in self.object_info:
+                cached_info = self.object_info[obj_id]
+                # 최근 5프레임의 위치 정보 수집
+                for frame_offset in range(1, 6):
+                    frame_key = f'position_frame_{current_frame - frame_offset}'
+                    if frame_key in cached_info:
+                        position_history.append(cached_info[frame_key])
+            
+            # 현재 프레임의 위치 계산
             position = pc.mean(1)
             pos_3d = position[:3]
+            
+            # 이전 위치 정보와 결합 (Multi-frame 추정)
+            if len(position_history) >= 2:
+                # 이전 위치들의 중앙값과 현재 위치의 가중 평균
+                position_history_array = np.array(position_history)
+                median_prev_pos = np.median(position_history_array, axis=0)
+                # 현재 위치에 더 높은 가중치 (0.7), 이전 위치에 낮은 가중치 (0.3)
+                pos_3d = 0.7 * pos_3d + 0.3 * median_prev_pos[:3]
+                confidence = min(confidence + 0.2, 1.0)  # 신뢰도 증가
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.debug(
+                        "[AgentMemory] cal_object_position: multi-frame estimation for id=%s (history_size=%d, confidence=%.2f)",
+                        obj_id,
+                        len(position_history),
+                        confidence,
+                    )
+            
+            # 방법 3: 계산된 위치를 object_info에 저장 (다음 프레임을 위해)
+            if obj_id is not None:
+                if not hasattr(self, 'object_info'):
+                    self.object_info = {}
+                if obj_id not in self.object_info:
+                    self.object_info[obj_id] = {}
+                self.object_info[obj_id]['last_known_position'] = pos_3d.copy() if isinstance(pos_3d, np.ndarray) else pos_3d
+                self.object_info[obj_id]['last_seen_frame'] = current_frame
+                # 최근 5프레임의 위치 저장 (Multi-frame 추정을 위해)
+                frame_key = f'position_frame_{current_frame}'
+                self.object_info[obj_id][frame_key] = pos_3d.copy() if isinstance(pos_3d, np.ndarray) else pos_3d
+                # 오래된 프레임 정보 제거 (메모리 절약)
+                for old_frame in range(current_frame - 10, current_frame - 5):
+                    old_frame_key = f'position_frame_{old_frame}'
+                    self.object_info[obj_id].pop(old_frame_key, None)
             
             # Validate position against map bounds (COELA-style filtering)
             # This prevents storing invalid positions that are outside the map
@@ -417,9 +498,9 @@ class AgentMemory():
                                 z_max if z_max is not None else 999,
                             )
                             self._logged_out_of_bounds.add(obj_id)
-                    return None, None
+                    return None, None, 0.0
             
-            return pos_3d, pc
+            return pos_3d, pc, confidence
         except Exception as exc:
             if hasattr(self, 'logger') and self.logger:
                 self.logger.warning(
@@ -428,7 +509,7 @@ class AgentMemory():
                     o_dict.get('name'),
                     exc,
                 )
-            return None, None
+            return None, None, 0.0
     
     def get_object_list(self):
         self.oppo_this_step = False
@@ -477,7 +558,7 @@ class AgentMemory():
             
             # If position not obtained from object_manager, calculate from depth map
             if position is None:
-                position, pc = self.cal_object_position(o_dict)
+                position, pc, confidence = self.cal_object_position(o_dict)
                 # If calculated position is outside map bounds and this is goal_position_id, try to get actual position
                 if position is not None and goal_position_id is not None and object_id == goal_position_id:
                     if self._scene_bounds is not None:

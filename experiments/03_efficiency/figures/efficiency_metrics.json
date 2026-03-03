@@ -1,0 +1,26 @@
+[
+  {
+    "run_dir": "/Users/giseong/Desktop/multi_agent/vico/CoELA/tdw_mat/results/vico_lite/vico_agent_test",
+    "run_name": "vico_agent_test",
+    "n_episodes": 4,
+    "n_completed": 3,
+    "total_finish": 4,
+    "total_items": 30,
+    "overall_completion": 0.13333333333333333,
+    "avg_frames_per_episode": 1677.0,
+    "avg_frames_note": "TDW simulation ticks per episode (not decision steps).",
+    "avg_steps_per_episode_estimated": 620,
+    "avg_steps_note": "Decision steps (env.step count); from ablation logs, episode steps 334–1233, mean ~620.",
+    "avg_ms_per_frame": 149.47852471047216,
+    "action_distribution": {
+      "move": 594,
+      "pick": 146,
+      "deliver": 360
+    },
+    "decision_source": {
+      "heuristic": 1023,
+      "llm": 0
+    },
+    "heuristic_ratio": 1.0
+  }
+]

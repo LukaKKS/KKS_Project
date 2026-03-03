@@ -19,6 +19,7 @@ class SharedStateSnapshot:
     agent_id: Optional[int] = None
     skip_targets: Dict[str, List] = field(default_factory=dict)
     nav_guard_info: Dict[Tuple[float, float], int] = field(default_factory=dict)
+    obstacle_coords: Dict[Tuple[float, float], int] = field(default_factory=dict)  # 장애물 좌표: {(x, z): detected_frame}
 
 
 class SharedMemory:

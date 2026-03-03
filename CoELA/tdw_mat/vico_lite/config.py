@@ -91,8 +91,8 @@ class ViCoConfig:
 
     # Navigation
     navigation_guard_ratio: float = 1.8
-    use_continuous_navigation: bool = True  # Use continuous movement for long distances
-    continuous_navigation_threshold: float = 5.0  # Use continuous movement if distance > 5m
+    use_continuous_navigation: bool = True  # Use continuous movement (기존처럼 연속 이동)
+    continuous_navigation_threshold: float = 2.0  # Use continuous movement if distance > 2m (짧은 거리는 discrete로 처리하여 프레임 절약)
 
     # Logging
     log_json_pretty: bool = False

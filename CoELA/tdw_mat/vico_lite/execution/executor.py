@@ -167,34 +167,62 @@ class PlanExecutor:
         
         if use_continuous_for_deliver and self.cfg.use_continuous_navigation:
             # Force continuous navigation for deliver to avoid guard blocking
+            # Use arrived_at (2.5m) for deliver to ensure we get close enough for put_in
+            # 프레임 절약을 위해 arrived_at을 조금 크게 설정 (2.0m -> 2.5m)
+            arrived_at = 2.5  # For deliver, we want to get within 2.5m to ensure put_in can execute (프레임 절약)
             action = {
                 "type": 9,  # Continuous movement
                 "target_position": target_pos,
+                "arrived_at": arrived_at,  # Explicitly set arrived_at for deliver
             }
             nav_meta = {
                 "navigation": "continuous_move_to_position",
                 "distance": actual_distance,
                 "method": "continuous",
+                "arrived_at": arrived_at,
             }
+            if self.logger:
+                self.logger.debug(
+                    "[Executor] deliver: using continuous navigation (dist=%.2f > 3.0m, arrived_at=%.2fm)",
+                    actual_distance,
+                    arrived_at,
+                )
             command = action
             meta.update(nav_meta)
         else:
-            command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True)
+            command, nav_meta = self._navigate_to(target_pos, agent_state, follow=True, is_goal_position=is_goal_position)
             meta.update(nav_meta)
             # Check if navigation failed but we're still close enough
+            # 장애물 감지 시에도 거리 확인하여 put_in 시도 (보완 로직)
             if nav_meta.get("forced_failure") and actual_distance <= distance_threshold:
                 if self.logger:
                     self.logger.info(
-                        "[Executor] deliver: navigation failed but close enough (dist=%.2f), attempting put_in",
+                        "[Executor] deliver: navigation failed but close enough (dist=%.2f <= %.2f), attempting put_in",
                         actual_distance,
+                        distance_threshold,
                     )
                 command = {"type": 4}
-                meta.update({"result": "put_in_after_nav_failure", "distance": actual_distance})
+                meta.update({"result": "put_in_after_nav_failure", "distance": actual_distance, "distance_threshold": distance_threshold})
+            elif nav_meta.get("forced_failure") and actual_distance != float("inf"):
+                # Navigation 실패했지만 거리가 임계값보다 약간 큰 경우 (3.0m 이내면 시도)
+                # deliver_fail_count를 고려하여 동적 임계값 적용
+                deliver_fail_count = agent_state.get("deliver_fail_count", {}).get(target_id, 0)
+                dynamic_threshold = min(distance_threshold + (deliver_fail_count * 0.1), 3.0)  # 최대 3.0m
+                if actual_distance <= dynamic_threshold:
+                    if self.logger:
+                        self.logger.info(
+                            "[Executor] deliver: navigation failed but within dynamic threshold (dist=%.2f <= %.2f, fail_count=%d), attempting put_in",
+                            actual_distance,
+                            dynamic_threshold,
+                            deliver_fail_count,
+                        )
+                    command = {"type": 4}
+                    meta.update({"result": "put_in_after_nav_failure_dynamic", "distance": actual_distance, "dynamic_threshold": dynamic_threshold, "deliver_fail_count": deliver_fail_count})
         
         return command, meta
 
     # ---------------------------------------------------------------------
-    def _navigate_to(self, target_pos, agent_state, follow: bool = False, skip_clamp: bool = False, arrived_at: Optional[float] = None):
+    def _navigate_to(self, target_pos, agent_state, follow: bool = False, skip_clamp: bool = False, arrived_at: Optional[float] = None, is_goal_position: bool = False):
         meta: Dict[str, Any] = {"navigation": "idle"}
         if target_pos is None:
             return {"type": "ongoing"}, meta
@@ -267,8 +295,9 @@ class PlanExecutor:
                 )
             # Return continuous movement action (type 9)
             # Use smaller arrived_at for pick actions (0.3m) to get closer to objects
+            # 프레임 절약을 위해 arrived_at을 조금 크게 설정 (너무 가까이 가지 않도록)
             if arrived_at is None:
-                arrived_at = 0.7  # Default for general navigation
+                arrived_at = 1.0  # Default for general navigation (0.7m -> 1.0m로 증가하여 프레임 절약)
             action = {
                 "type": 9,  # New action type for continuous movement
                 "target_position": target_pos,
@@ -290,7 +319,24 @@ class PlanExecutor:
                 "method": "discrete",
             })
             guard_threshold = self._guard_threshold()
-            if path_len is not None and guard_threshold is not None and path_len > guard_threshold:
+            # 개선: path_len이 너무 길면 (100 이상) 무조건 skip (CoELA의 EXPLORE_MAX_COST=10000과 유사한 개념)
+            # 단, deliver (goal_position_id)의 경우 반드시 도달해야 하므로 제한을 완화 (200까지 허용)
+            max_path_length = 200 if is_goal_position else 100  # deliver의 경우 200까지 허용
+            if path_len is not None and path_len > max_path_length:
+                key = tuple(int(x * 10) for x in target_pos[:2])
+                self._guard_skip[key] = {"frames": self.guard_skip_decay, "target": target_pos}
+                meta.update({"navigation": "guard_turn", "distance": path_len, "reason": "path_too_long", "forced_failure": True})
+                if self.logger:
+                    self.logger.warning(
+                        "[Executor] Guard triggered for agent %s (len=%.2f > max=%d) target=%s - path too long, skipping (is_goal_position=%s)",
+                        self.agent_id,
+                        path_len,
+                        max_path_length,
+                        target_pos,
+                        is_goal_position,
+                    )
+                return {"type": "ongoing"}, meta
+            elif path_len is not None and guard_threshold is not None and path_len > guard_threshold:
                 key = tuple(int(x * 10) for x in target_pos[:2])
                 self._guard_skip[key] = {"frames": self.guard_skip_decay, "target": target_pos}
                 meta.update({"navigation": "guard_turn", "distance": path_len, "reason": "path_too_long", "forced_failure": True})
@@ -386,12 +432,24 @@ class PlanExecutor:
                         )
                     meta["guard_ignored"] = True
         else:
-            # 핵심 수정: target_pos is None이지만 distance가 있으면 navigation 시도 (task target인 경우)
+            # 방법 1: Depth 기반 거리 추정 활용 강화 - target_pos is None이지만 distance가 있으면 navigation 시도
             # 10m 제한으로 인해 위치 계산이 실패했지만 depth로 거리는 알 수 있는 경우
             is_task_target = plan.meta.get("is_task_target", False)
             retry_navigation = plan.meta.get("reason") == "retry_navigation_after_failure"
+            use_reach_for_flag = plan.meta.get("use_reach_for", False)
             
-            if is_force_pick and force_pick_distance is not None:
+            # 방법 1: use_reach_for 플래그가 있으면 바로 reach_for 사용
+            if use_reach_for_flag:
+                if self.logger:
+                    self.logger.info(
+                        "[Executor] pick: use_reach_for flag set, using reach_for with object_id=%s (no position)",
+                        target_id,
+                    )
+                meta["navigation"] = "reach_for_with_object_id"
+                meta["distance"] = force_pick_distance
+                meta["note"] = "use_reach_for_flag_set"
+                # Will use reach_for (type 3) below - skip to pick section
+            elif is_force_pick and force_pick_distance is not None:
                 if force_pick_distance <= 2.5:
                     # Close enough for direct pick
                     if self.logger:
@@ -490,13 +548,17 @@ class PlanExecutor:
                 if target_id_int not in self.agent_memory.object_info:
                     object_in_memory = False
                     is_task_target = plan.meta.get("is_task_target", False)
+                    use_reach_for_flag = plan.meta.get("use_reach_for", False)
                     # 핵심 수정: target_pos가 None이고 reach_for를 사용할 경우, object_id 체크를 건너뜀
                     # reach_for (type 3)는 object_id만으로도 동작하므로 object_info에 없어도 사용 가능
-                    if target_pos is None and meta.get("note") == "no_position_using_object_id_reach_for":
+                    # use_reach_for 플래그가 설정되어 있거나, meta note가 reach_for 관련이면 허용
+                    if use_reach_for_flag or (target_pos is None and meta.get("note") in ("no_position_using_object_id_reach_for", "use_reach_for_flag_set")):
                         if self.logger:
                             self.logger.info(
-                                "[Executor] object_id=%s not in agent_memory.object_info but will use reach_for (type 3), skipping object_info check",
+                                "[Executor] object_id=%s not in agent_memory.object_info but will use reach_for (type 3), skipping object_info check (use_reach_for=%s, note=%s)",
                                 target_id_int,
+                                use_reach_for_flag,
+                                meta.get("note"),
                             )
                         # object_in_memory를 True로 설정하여 이후 로직에서 reach_for를 사용할 수 있도록 함
                         object_in_memory = True
@@ -567,8 +629,10 @@ class PlanExecutor:
         
         # 핵심 수정: target_pos가 None이고 object_id만 있는 경우, reach_for (type 3)를 바로 사용
         # reach_for는 자동으로 navigation을 수행하므로 거리 체크를 건너뜀
-        # invalid_position_using_object_id_reach_for 케이스도 포함
-        if target_pos is None and (meta.get("note") == "no_position_using_object_id_reach_for" or meta.get("note") == "invalid_position_using_object_id_reach_for"):
+        # use_reach_for 플래그가 설정되어 있거나, meta note가 reach_for 관련이면 허용
+        use_reach_for_flag = plan.meta.get("use_reach_for", False)
+        reach_for_notes = ("no_position_using_object_id_reach_for", "invalid_position_using_object_id_reach_for", "use_reach_for_flag_set")
+        if use_reach_for_flag or (target_pos is None and meta.get("note") in reach_for_notes):
             # Use reach_for (type 3) which will automatically navigate to object_id
             holding_slots = agent_state.get("holding_slots", {}) if isinstance(agent_state, dict) else {}
             left_busy = holding_slots.get("left") is not None

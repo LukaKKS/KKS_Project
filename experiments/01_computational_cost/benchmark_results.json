@@ -1,0 +1,108 @@
+{
+  "device": "cpu",
+  "runs": 100,
+  "warmup": 10,
+  "torch_version": "2.8.0",
+  "results": [
+    {
+      "component": "clip_image_encode",
+      "device": "cpu",
+      "mean_ms": 43.0812,
+      "std_ms": 5.7325,
+      "min_ms": 38.0674,
+      "max_ms": 79.7333,
+      "median_ms": 42.1368,
+      "p95_ms": 48.8966,
+      "n_runs": 100
+    },
+    {
+      "component": "clip_text_encode",
+      "device": "cpu",
+      "mean_ms": 25.9259,
+      "std_ms": 1.873,
+      "min_ms": 22.493,
+      "max_ms": 34.4288,
+      "median_ms": 25.4938,
+      "p95_ms": 29.3299,
+      "n_runs": 100
+    },
+    {
+      "component": "ema_memory_update",
+      "device": "cpu",
+      "latent_dim": 1024,
+      "mean_ms": 0.0115,
+      "std_ms": 0.0025,
+      "min_ms": 0.0038,
+      "max_ms": 0.025,
+      "median_ms": 0.011,
+      "p95_ms": 0.0154,
+      "n_runs": 100
+    },
+    {
+      "component": "team_hub_update",
+      "device": "cpu",
+      "n_agents": 2,
+      "mean_ms": 0.0371,
+      "std_ms": 0.0052,
+      "min_ms": 0.034,
+      "max_ms": 0.0815,
+      "median_ms": 0.0357,
+      "p95_ms": 0.0428,
+      "n_runs": 100
+    },
+    {
+      "component": "heuristic_scoring",
+      "n_candidates": 10,
+      "mean_ms": 0.0656,
+      "std_ms": 0.0019,
+      "min_ms": 0.0642,
+      "max_ms": 0.0735,
+      "median_ms": 0.065,
+      "p95_ms": 0.0703,
+      "n_runs": 100
+    },
+    {
+      "component": "astar_pathfinding",
+      "map_sizes": {
+        "120x120": {
+          "mean_ms": 1.1996,
+          "std_ms": 0.1887,
+          "min_ms": 0.9909,
+          "max_ms": 1.8689,
+          "median_ms": 1.1462,
+          "p95_ms": 1.6528,
+          "n_runs": 100
+        },
+        "240x240": {
+          "mean_ms": 4.9065,
+          "std_ms": 0.1783,
+          "min_ms": 4.5825,
+          "max_ms": 5.4057,
+          "median_ms": 4.877,
+          "p95_ms": 5.2825,
+          "n_runs": 100
+        },
+        "480x480": {
+          "mean_ms": 29.5255,
+          "std_ms": 0.7277,
+          "min_ms": 28.4612,
+          "max_ms": 32.8441,
+          "median_ms": 29.3938,
+          "p95_ms": 31.02,
+          "n_runs": 100
+        }
+      }
+    },
+    {
+      "component": "full_perception_pipeline",
+      "device": "cpu",
+      "mean_ms": 72.6078,
+      "std_ms": 5.2396,
+      "min_ms": 64.372,
+      "max_ms": 94.4042,
+      "median_ms": 72.3581,
+      "p95_ms": 81.9088,
+      "n_runs": 100
+    }
+  ]
+}

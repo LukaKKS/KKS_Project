@@ -453,11 +453,20 @@ class TDW(Env):
         
         place_pos = self.object_manager.transforms[self.goal_position_id].position
         count = 0
+        checked_count = 0
         for object_id in self.target_object_ids:
+            checked_count += 1
             # If object is already satisfied, count it even if it's not in transforms anymore
             # (objects may be removed from transforms after being delivered)
             if object_id in self.satisfied.keys():
                 count += 1
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.debug(
+                        "[TDW] check_goal: object_id=%d already satisfied (count=%d/%d)",
+                        object_id,
+                        count,
+                        len(self.target_object_ids),
+                    )
                 continue
             
             # Check if object_id exists in object_manager.transforms to prevent KeyError
@@ -469,9 +478,28 @@ class TDW(Env):
                     )
                 continue
             pos = self.object_manager.transforms[object_id].position
-            if self.get_2d_distance(pos, place_pos) < 3 and self.belongs_to_which_room(pos) is not None and 'Bedroom' in self.belongs_to_which_room(pos):
+            distance = self.get_2d_distance(pos, place_pos)
+            room = self.belongs_to_which_room(pos)
+            is_in_bedroom = room is not None and 'Bedroom' in room
+            if distance < 3 and is_in_bedroom:
                 count += 1
                 self.satisfied[object_id] = True
+                if hasattr(self, 'logger') and self.logger:
+                    self.logger.info(
+                        "[TDW] check_goal: object_id=%d satisfied! dist=%.2f room=%s (count=%d/%d)",
+                        object_id,
+                        distance,
+                        room,
+                        count,
+                        len(self.target_object_ids),
+                    )
+            elif hasattr(self, 'logger') and self.logger and checked_count <= 3:  # Log first 3 objects for debugging
+                self.logger.debug(
+                    "[TDW] check_goal: object_id=%d not satisfied: dist=%.2f (need <3.0) room=%s (need Bedroom)",
+                    object_id,
+                    distance,
+                    room,
+                )
         return count, len(self.target_object_ids), count == len(self.target_object_ids)
 
     def get_id_from_mask(self, agent_id, mask, name = None):
@@ -804,16 +832,18 @@ class TDW(Env):
                 finish = True
                 break
             # Check if total frames exceeded max_frame
-            if self.num_frames + num_frames >= self.max_frame:
-                if hasattr(self, 'logger') and self.logger:
-                    self.logger.warning(
-                        "[TDW] step: total frames (%d + %d) >= max_frame (%d), forcing finish",
-                        self.num_frames,
-                        num_frames,
-                        self.max_frame,
-                    )
-                finish = True
-                break
+            # 주의: challenge.py에서 step 기반 종료를 관리하므로, 여기서는 frame 체크를 비활성화
+            # 대신 max_frames_per_step 체크만 유지 (무한 루프 방지)
+            # if self.num_frames + num_frames >= self.max_frame:
+            #     if hasattr(self, 'logger') and self.logger:
+            #         self.logger.warning(
+            #             "[TDW] step: total frames (%d + %d) >= max_frame (%d), forcing finish",
+            #             self.num_frames,
+            #             num_frames,
+            #             self.max_frame,
+            #         )
+            #     finish = True
+            #     break
             all_finished = True
             for replicant_id in self.controller.replicants:
                 if delay_frame_count[replicant_id] > 0:
@@ -1334,7 +1364,9 @@ class TDW(Env):
         self.num_step += 1        
         self.reward += reward
         done = False
-        if self.num_frames >= self.max_frame or self.success:
+        # 주의: challenge.py에서 step 기반 종료를 관리하므로, 여기서는 frame 체크를 비활성화
+        # if self.num_frames >= self.max_frame or self.success:
+        if self.success:  # success 체크만 유지
             done = True
             self.done = True
         

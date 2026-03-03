@@ -1,0 +1,13 @@
+\begin{table}[t]
+\centering
+\caption{ViCo-Lite efficiency metrics across experimental runs. Heuristic ratio shows the fraction of decisions made without LLM calls.}
+\label{tab:efficiency}
+\begin{tabular}{lccccc}
+\toprule
+\textbf{Run} & \textbf{Episodes} & \textbf{Completion} & \textbf{Avg Steps} & \textbf{ms/step} & \textbf{Heur. \%} \\
+\midrule
+vico\_agent\_test & 4 & 13.3\% & 620$^\dagger$ & 149 & 100\% \\
+\multicolumn{6}{l}{\footnotesize $^\dagger$Avg steps per episode (env.step count); 1677 is avg TDW frames. Step estimate from ablation logs.} \\
+\bottomrule
+\end{tabular}
+\end{table}

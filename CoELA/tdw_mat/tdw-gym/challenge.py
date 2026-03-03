@@ -56,70 +56,120 @@ class Challenge:
 
             if not os.path.exists(os.path.join(self.output_dir, str(episode))):
                 os.makedirs(os.path.join(self.output_dir, str(episode)))
-            self.logger.info('Episode {} ({}/{})'.format(episode, i + 1, num_eval_episodes))
-            self.logger.info(f"Resetting Environment ... data is {self.data[episode]}")
-            state, info, env_api = self.env.reset(seed=self.data[episode]['seed'], options=self.data[episode], output_dir = os.path.join(self.output_dir, str(episode)))
-            for id, agent in enumerate(agents):
-                if type(env_api) == list:
-                    curr_api = env_api[id]
-                else: curr_api = env_api
-                if info['goal_description'] is not None:
-                    if agent.agent_type == 'h_agent':
-                        agent.reset(goal_objects = info['goal_description'], output_dir = os.path.join(self.output_dir, str(episode)), env_api = curr_api, agent_color = info['agent_colors'][id], agent_id = id, gt_mask = self.gt_mask, save_img = self.save_img)
-                    elif agent.agent_type == 'lm_agent':
-                        agent.reset(obs = state[str(id)], goal_objects = info['goal_description'], output_dir = os.path.join(self.output_dir, str(episode)), env_api = curr_api, agent_color = info['agent_colors'][id], agent_id = id, rooms_name=info['rooms_name'], gt_mask = self.gt_mask, save_img = self.save_img)
-                    elif agent.agent_type == 'vico_agent':
-                        agent.reset(
-                            obs=state[str(id)],
-                            goal_objects=info['goal_description'],
-                            output_dir=os.path.join(self.output_dir, str(episode)),
-                            env_api=curr_api,
-                            agent_color=info['agent_colors'][id],
-                            agent_id=id,
-                            rooms_name=info['rooms_name'],
-                            gt_mask=self.gt_mask,
-                            save_img=self.save_img,
-                            episode_index=episode,
-                        )
-                    else:
-                        raise Exception(f"{agent.agent_type} not available")
-                else:
-                    agent.reset(output_dir = os.path.join(self.output_dir, str(episode)))
-            self.logger.info(f"Environment Reset. Took {time.time() - start_time} secs")
-            local_finish = self.env.check_goal()
-            done = False
-            step_num = 0
-            local_reward = 0.0
-            while not done:
-                step_num += 1
-                actions = {}
-                if self.save_img: self.env.save_images(os.path.join(self.output_dir, str(episode), 'Images'))
-                replicant_ids = getattr(self.env, "replicant_ids", [i for i in range(len(agents))])
-                for agent_index, agent in enumerate(agents):
-                    if agent_index >= len(replicant_ids):
-                        continue
-                    replicant_id = replicant_ids[agent_index]
-                    state_key = str(replicant_id)
-                    if state_key not in state:
-                        fallback_key = str(agent_index)
-                        if fallback_key in state:
-                            state_key = fallback_key
+            
+            # 개선: 각 에피소드 폴더에 로그 파일 핸들러 추가
+            episode_log_dir = os.path.join(self.output_dir, str(episode))
+            episode_file_handler = logging.FileHandler(os.path.join(episode_log_dir, "output.log"))
+            episode_file_handler.setLevel(logging.DEBUG)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            episode_file_handler.setFormatter(formatter)
+            logger.addHandler(episode_file_handler)
+            
+            try:
+                self.logger.info('Episode {} ({}/{})'.format(episode, i + 1, num_eval_episodes))
+                self.logger.info(f"Resetting Environment ... data is {self.data[episode]}")
+                state, info, env_api = self.env.reset(seed=self.data[episode]['seed'], options=self.data[episode], output_dir = os.path.join(self.output_dir, str(episode)))
+                for id, agent in enumerate(agents):
+                    if type(env_api) == list:
+                        curr_api = env_api[id]
+                    else: curr_api = env_api
+                    if info['goal_description'] is not None:
+                        if agent.agent_type == 'h_agent':
+                            agent.reset(goal_objects = info['goal_description'], output_dir = os.path.join(self.output_dir, str(episode)), env_api = curr_api, agent_color = info['agent_colors'][id], agent_id = id, gt_mask = self.gt_mask, save_img = self.save_img)
+                        elif agent.agent_type == 'lm_agent':
+                            agent.reset(obs = state[str(id)], goal_objects = info['goal_description'], output_dir = os.path.join(self.output_dir, str(episode)), env_api = curr_api, agent_color = info['agent_colors'][id], agent_id = id, rooms_name=info['rooms_name'], gt_mask = self.gt_mask, save_img = self.save_img)
+                        elif agent.agent_type == 'vico_agent':
+                            agent.reset(
+                                obs=state[str(id)],
+                                goal_objects=info['goal_description'],
+                                output_dir=os.path.join(self.output_dir, str(episode)),
+                                env_api=curr_api,
+                                agent_color=info['agent_colors'][id],
+                                agent_id=id,
+                                rooms_name=info['rooms_name'],
+                                gt_mask=self.gt_mask,
+                                save_img=self.save_img,
+                                episode_index=episode,
+                            )
                         else:
-                            state_key = next(iter(state.keys()))
-                    action_cmd = agent.act(state[state_key])
-                    if action_cmd is None:
-                        action_cmd = {"type": "ongoing"}
-                    actions[str(replicant_id)] = action_cmd
-                for replicant_id in replicant_ids:
-                    key = str(replicant_id)
-                    if key not in actions:
-                        actions[key] = {"type": "ongoing"}
-                state, reward, done, info = self.env.step(actions)
-                local_reward += reward
+                            raise Exception(f"{agent.agent_type} not available")
+                    else:
+                        agent.reset(output_dir = os.path.join(self.output_dir, str(episode)))
+                self.logger.info(f"Environment Reset. Took {time.time() - start_time} secs")
                 local_finish = self.env.check_goal()
-                self.logger.info(f"Executing step {step_num} for episode: {episode}, actions: {actions}, finish: {local_finish}, frame: {self.env.num_frames}")
-                if done:
-                    break
+                done = False
+                step_num = 0
+                local_reward = 0.0
+                local_finish = None
+                while not done:
+                    step_num += 1
+                    # 개선: 프레임 대신 스텝으로 종료 조건 체크 (3000 스텝)
+                    if step_num > self.max_frames:
+                        self.logger.info(f"Episode {episode} reached max_steps={self.max_frames} at step {step_num}, forcing finish")
+                        done = True
+                        local_finish = self.env.check_goal()
+                        self.logger.info(f"Episode {episode} done at step {step_num} (max_steps reached), final check_goal: {local_finish}, frame: {self.env.num_frames}")
+                        break
+                    actions = {}
+                    if self.save_img: self.env.save_images(os.path.join(self.output_dir, str(episode), 'Images'))
+                    replicant_ids = getattr(self.env, "replicant_ids", [i for i in range(len(agents))])
+                    for agent_index, agent in enumerate(agents):
+                        if agent_index >= len(replicant_ids):
+                            continue
+                        replicant_id = replicant_ids[agent_index]
+                        state_key = str(replicant_id)
+                        if state_key not in state:
+                            fallback_key = str(agent_index)
+                            if fallback_key in state:
+                                state_key = fallback_key
+                            else:
+                                state_key = next(iter(state.keys()))
+                        action_cmd = agent.act(state[state_key])
+                        if action_cmd is None:
+                            action_cmd = {"type": "ongoing"}
+                        actions[str(replicant_id)] = action_cmd
+                    for replicant_id in replicant_ids:
+                        key = str(replicant_id)
+                        if key not in actions:
+                            actions[key] = {"type": "ongoing"}
+                    state, reward, done, info = self.env.step(actions)
+                    local_reward += reward
+                    local_finish = self.env.check_goal()
+                    self.logger.info(f"Executing step {step_num} for episode: {episode}, actions: {actions}, finish: {local_finish}, frame: {self.env.num_frames}")
+                    if done:
+                        # Ensure check_goal is called one more time when done
+                        local_finish = self.env.check_goal()
+                        self.logger.info(f"Episode {episode} done at step {step_num}, final check_goal: {local_finish}, frame: {self.env.num_frames}")
+                        break
+            except Exception as e:
+                self.logger.error(f"Error during episode {episode} execution: {e}", exc_info=True)
+                # Try to get final check_goal even if there was an error
+                if local_finish is None:
+                    try:
+                        local_finish = self.env.check_goal()
+                        self.logger.info(f"Error recovery: check_goal called after exception, finish: {local_finish}")
+                    except Exception as e2:
+                        self.logger.error(f"Failed to call check_goal after error: {e2}")
+                        local_finish = (0, 10, False)  # Default fallback
+                raise
+            finally:
+                # Ensure check_goal is always called at the end
+                if local_finish is None:
+                    try:
+                        local_finish = self.env.check_goal()
+                        self.logger.info(f"Finally block: check_goal called, finish: {local_finish}")
+                    except Exception as e:
+                        self.logger.error(f"Failed to call check_goal in finally block: {e}")
+                        local_finish = (0, 10, False)  # Default fallback
+                # Finally 블록에서 FileHandler 제거 (에피소드 종료 시 항상 실행)
+                if episode_file_handler in logger.handlers:
+                    logger.removeHandler(episode_file_handler)
+                    episode_file_handler.close()
+            
+            if local_finish is None:
+                self.logger.warning(f"local_finish is None for episode {episode}, using default")
+                local_finish = (0, 10, False)
+            
             total_finish += local_finish[0] / local_finish[1]
             result = {
                 "finish": local_finish[0],
@@ -145,16 +195,17 @@ class Challenge:
 def init_logs(output_dir, name = 'simple_example'):
     logger = logging.getLogger(name)
     logger.setLevel(logging.DEBUG)
-    fh = logging.FileHandler(os.path.join(output_dir, "output.log"))
-    fh.setLevel(logging.DEBUG)
+    # 개선: 전체 로그 파일은 생성하지 않음 (각 에피소드 폴더에만 로그 생성)
+    # fh = logging.FileHandler(os.path.join(output_dir, "output.log"))
+    # fh.setLevel(logging.DEBUG)
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
 
     formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    fh.setFormatter(formatter)
+    # fh.setFormatter(formatter)
     ch.setFormatter(formatter)
-    logger.addHandler(fh)
-    logger.addHandler(ch)
+    # logger.addHandler(fh)  # 전체 로그 파일 핸들러 제거
+    logger.addHandler(ch)  # 콘솔 출력만 유지
     return logger
 
 
@@ -168,7 +219,7 @@ def main():
     parser.add_argument("--port", default=1071, type=int)
     parser.add_argument("--agents", nargs='+', type=str, default=("h_agent",))
     parser.add_argument("--eval_episodes", nargs='+', default=(-1,), type=int, help="which episodes to evaluate on")
-    parser.add_argument("--max_frames", default=3000, type=int, help="max frames per episode")
+    parser.add_argument("--max_frames", default=3000, type=int, help="max steps per episode (changed from frames to steps)")
     parser.add_argument("--no_launch_build", action='store_true')
     parser.add_argument("--communication", action='store_true')
     parser.add_argument("--debug", action='store_true')

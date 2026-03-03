@@ -1,0 +1,50 @@
+{
+  "clip": {
+    "model": "CLIP ViT-B/32",
+    "parameters": {
+      "total_params": 151277313,
+      "total_params_M": 151.28,
+      "trainable_params": 151277313
+    },
+    "image_encoder_flops": 8774443008,
+    "image_encoder_gflops": 8.774,
+    "text_encoder_flops": 5890024448,
+    "text_encoder_gflops": 5.89
+  },
+  "ema": {
+    "component": "ema_memory_update",
+    "latent_dim": 1024,
+    "flops_per_update": 3072,
+    "note": "3 ops/element: 2 mul + 1 add"
+  },
+  "heuristic": {
+    "component": "heuristic_scoring",
+    "n_candidates": 10,
+    "flops_per_call": 150,
+    "note": "15 ops/candidate"
+  },
+  "astar_120": {
+    "component": "astar_pathfinding",
+    "map_size": "120x120",
+    "vertices": 14400,
+    "theoretical_ops_O_ElogV": 795673,
+    "preprocessing_ops": 561600,
+    "note": "Actual ops depend on path length and obstacles"
+  },
+  "astar_240": {
+    "component": "astar_pathfinding",
+    "map_size": "240x240",
+    "vertices": 57600,
+    "theoretical_ops_O_ElogV": 3643495,
+    "preprocessing_ops": 2246400,
+    "note": "Actual ops depend on path length and obstacles"
+  },
+  "astar_480": {
+    "component": "astar_pathfinding",
+    "map_size": "480x480",
+    "vertices": 230400,
+    "theoretical_ops_O_ElogV": 16417180,
+    "preprocessing_ops": 8985600,
+    "note": "Actual ops depend on path length and obstacles"
+  }
+}

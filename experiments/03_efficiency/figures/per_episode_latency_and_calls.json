@@ -1,0 +1,34 @@
+{
+  "description": "에피소드 1개 기준 호출 횟수·지연. 스텝=env.step() 횟수(결정 횟수), 평균 620 steps/episode (ablation 로그 기준). Call counts assumed (not instrumented).",
+  "source": {
+    "avg_steps_per_episode": 620,
+    "avg_steps_note": "From ablation logs (02_ablation): episode final steps 334–1233, mean ~623 over 12 episodes.",
+    "avg_frames_per_episode": 1677,
+    "frames_note": "TDW simulation ticks; not used for call counts (policy runs per step, not per frame).",
+    "n_agents": 2,
+    "benchmark": "01_computational_cost/benchmark_results.json",
+    "run": "vico_agent_test"
+  },
+  "per_episode": {
+    "calls": {
+      "full_perception": 1240,
+      "ema_memory_update": 1240,
+      "team_hub_update": 620,
+      "heuristic_scoring": 1240,
+      "astar_240x240": 124
+    },
+    "latency_ms": {
+      "full_perception": 90036,
+      "ema_memory_update": 15,
+      "team_hub_update": 23,
+      "heuristic_scoring": 82,
+      "astar_240x240": 609
+    },
+    "latency_total_ms": 90765,
+    "latency_total_sec": 90.8
+  },
+  "per_step_avg": {
+    "calls_per_step": { "perception_ema_heuristic": 6, "team_hub": 1, "astar": 0.2 },
+    "latency_ms_per_step": 146
+  }
+}

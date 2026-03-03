@@ -24,6 +24,8 @@ class TeamMemoryHub:
         self._agent_skip_names: Dict[int, Set[str]] = {}
         self._agent_skip_coords: Dict[int, Set[Tuple[float, float]]] = {}
         self._agent_nav_guard: Dict[int, Dict[Tuple[float, float], int]] = {}
+        # 장애물 좌표 공유: {agent_id: {(x, z): frame}} - frame은 장애물이 감지된 시점
+        self._agent_obstacles: Dict[int, Dict[Tuple[float, float], int]] = {}
         self._ema: Optional[torch.Tensor] = None
         self._history: Deque[torch.Tensor] = deque(maxlen=self.max_history)
         self._step: int = 0
@@ -52,6 +54,7 @@ class TeamMemoryHub:
         self._agent_skip_names.clear()
         self._agent_skip_coords.clear()
         self._agent_nav_guard.clear()
+        self._agent_obstacles.clear()
         self._ema = None
         self._history.clear()
         self._step = 0
@@ -61,6 +64,7 @@ class TeamMemoryHub:
         self._agent_skip_names.setdefault(agent_id, set())
         self._agent_skip_coords.setdefault(agent_id, set())
         self._agent_nav_guard.setdefault(agent_id, {})
+        self._agent_obstacles.setdefault(agent_id, {})
 
     def reset_agent(self, agent_id: int) -> None:
         self._agent_latents.pop(agent_id, None)
@@ -68,6 +72,7 @@ class TeamMemoryHub:
         self._agent_skip_names.pop(agent_id, None)
         self._agent_skip_coords.pop(agent_id, None)
         self._agent_nav_guard.pop(agent_id, None)
+        self._agent_obstacles.pop(agent_id, None)
 
     def update(self, agent_id: int, perception: PerceptionOutput) -> SharedStateSnapshot:
         latent = perception.fused_latent.detach().to(self.device)
@@ -110,6 +115,26 @@ class TeamMemoryHub:
                 if q_key not in nav_guard_info or nav_guard_info[q_key] < cooldown:
                     nav_guard_info[q_key] = int(cooldown)
 
+        # 장애물 좌표 집계: 모든 에이전트의 장애물 좌표를 합침
+        # TTL(Time To Live)은 120프레임 (약 4초) - 오래된 장애물은 자동으로 제거
+        obstacle_coords: Dict[Tuple[float, float], int] = {}
+        current_frame = self._step
+        obstacle_ttl = 120  # 120프레임 동안 유지
+        for agent_id, obstacle_map in self._agent_obstacles.items():
+            for coord, detected_frame in obstacle_map.items():
+                # TTL 체크: 오래된 장애물은 제거
+                if current_frame - detected_frame < obstacle_ttl:
+                    q_coord = self._quantize_coord_pair(coord)
+                    # 가장 최근에 감지된 프레임을 저장
+                    if q_coord not in obstacle_coords or obstacle_coords[q_coord] < detected_frame:
+                        obstacle_coords[q_coord] = detected_frame
+        # TTL이 지난 장애물 제거
+        for agent_id in list(self._agent_obstacles.keys()):
+            self._agent_obstacles[agent_id] = {
+                coord: frame for coord, frame in self._agent_obstacles[agent_id].items()
+                if current_frame - frame < obstacle_ttl
+            }
+
         return SharedStateSnapshot(
             step=self._step,
             ema_latent=self._ema.detach().clone() if self._ema is not None else torch.zeros(
@@ -126,6 +151,7 @@ class TeamMemoryHub:
                 "coords": [list(coord) for coord in sorted(skip_coords)],
             },
             nav_guard_info=nav_guard_info,
+            obstacle_coords=obstacle_coords,
         )
 
     def update_skip_targets(
@@ -164,5 +190,24 @@ class TeamMemoryHub:
                 continue
             normalised[self._quantize_coord_pair(coord)] = int(value)
         self._agent_nav_guard[agent_id] = normalised
+
+    def update_obstacles(self, agent_id: int, obstacle_coords: Iterable[Tuple[float, float]], current_frame: int) -> None:
+        """장애물 좌표를 공유 메모리에 저장"""
+        if agent_id not in self._agent_obstacles:
+            self.register_agent(agent_id)
+        normalised: Dict[Tuple[float, float], int] = {}
+        for coord in obstacle_coords:
+            try:
+                if isinstance(coord, (list, tuple)) and len(coord) >= 2:
+                    q_coord = self._quantize_coord_pair((float(coord[0]), float(coord[1])))
+                    # 가장 최근 프레임으로 업데이트 (같은 좌표가 여러 번 감지되면 최신 것으로)
+                    if q_coord not in normalised or normalised[q_coord] < current_frame:
+                        normalised[q_coord] = current_frame
+            except Exception:
+                continue
+        # 기존 장애물과 병합 (최신 프레임 우선)
+        for q_coord, frame in normalised.items():
+            if q_coord not in self._agent_obstacles[agent_id] or self._agent_obstacles[agent_id][q_coord] < frame:
+                self._agent_obstacles[agent_id][q_coord] = frame
 
 

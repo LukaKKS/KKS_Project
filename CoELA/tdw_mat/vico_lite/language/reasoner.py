@@ -538,12 +538,70 @@ class PolicyReasoner:
             return ReasonerPlan("search", None, None, 0.3, {"reason": "fallback"})
         candidates.sort(key=lambda item: item[0], reverse=True)
         best = candidates[0][1]
+        target_name = best.get("target_name")
+        
+        # 개선: team_symbolic에서 target_id와 target_position 찾기
+        target_id = None
+        target_position = None
+        skip_ids = skip_spec.get("ids", set()) if isinstance(skip_spec, dict) else set()
+        team_symbolic = context.get("team_symbolic", [])
+        if target_name and team_symbolic:
+            # team_symbolic에서 같은 이름의 객체 찾기 (task target 우선)
+            best_entry = None
+            best_score = -1.0
+            for entry in team_symbolic:
+                entry_name = entry.get("name")
+                if not entry_name or str(entry_name).lower() != target_name.lower():
+                    continue
+                # Skip if in skip_ids
+                entry_id = entry.get("id")
+                if entry_id is not None and entry_id in skip_ids:
+                    continue
+                # Prefer task targets and grabbable objects
+                entry_score = 0.0
+                if entry.get("is_task_target"):
+                    entry_score += 10.0
+                if entry.get("is_grabbable"):
+                    entry_score += 5.0
+                # Prefer entries with position information
+                if entry.get("position") is not None or entry.get("location") is not None:
+                    entry_score += 2.0
+                if entry_score > best_score:
+                    best_score = entry_score
+                    best_entry = entry
+            
+            if best_entry:
+                target_id = best_entry.get("id")
+                # Try to get position from entry (but Policy will validate it)
+                target_position = best_entry.get("position") or best_entry.get("location")
+                # Normalize position format
+                if target_position is not None:
+                    if isinstance(target_position, (list, tuple)) and len(target_position) >= 3:
+                        # Ensure it's a tuple of floats
+                        try:
+                            target_position = (float(target_position[0]), float(target_position[1]), float(target_position[2]))
+                        except (ValueError, TypeError, IndexError):
+                            target_position = None
+                    else:
+                        target_position = None
+        
         meta = {
             "reason": "heuristic",
             "score": candidates[0][0],
-            "target_name": best.get("target_name"),
+            "target_name": target_name,
         }
-        return ReasonerPlan(action_type=best["action"], target_id=None, target_position=None, confidence=0.5, meta=meta)
+        if target_id is not None:
+            meta["target_id"] = target_id
+        if target_position is not None:
+            meta["target_position_source"] = "team_symbolic"
+        
+        return ReasonerPlan(
+            action_type=best["action"],
+            target_id=target_id,  # ✅ 개선: target_id 제공
+            target_position=target_position,  # ✅ 개선: target_position 제공 (가능하면)
+            confidence=0.5,
+            meta=meta,
+        )
 
     def _score_candidate(self, distance: float, similarity: float) -> float:
         weights = self.cfg.reasoner_heuristic_weights
